@@ -5,4 +5,4 @@ sqlalchemy
 plotly
 reportlab
 python-dateutil
-st_aggrid
+streamlit-aggrid
