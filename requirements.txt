@@ -7,4 +7,5 @@ reportlab
 python-dateutil
 streamlit-aggrid
 setuptools
+matplotlib
 
