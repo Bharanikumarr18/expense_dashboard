@@ -1,32 +1,61 @@
+from pkg_resources import safe_name
 import streamlit as st
 import pandas as pd
+import datetime
+from datetime import date, time
 from datetime import date, timedelta
+from sqlalchemy.orm import relationship
+from sqlalchemy.orm import joinedload
+from sqlalchemy import text
 from sqlalchemy import (
-    create_engine, Column, Integer, String,
+    DateTime, create_engine, Column, Integer, String,
     Float, Date, ForeignKey, UniqueConstraint, func
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 import plotly.express as px
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
 import io
+from io import BytesIO
 import subprocess
 import json
 import re
-import io
-from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 from reportlab.lib.units import cm
-from reportlab.platypus import Paragraph
 from reportlab.lib.styles import ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+import requests
+import matplotlib.pyplot as plt
+from dateutil.relativedelta import relativedelta
+import os, time, platform, subprocess
 
 
+pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
+
+# ==============
+# SESSION STATE
+# ==============
+if "open_asset_inputs" not in st.session_state: 
+    st.session_state.open_asset_inputs = False
+
+# =======================
+# WEEKLY TREND VISIBILITY
+# =======================
 if "show_weekly_trend" not in st.session_state:
     st.session_state.show_weekly_trend = True
-
+# ==============
+# FLASH MESSAGE
+# ==============
+def flash(message, kind="success"):
+    st.session_state.setdefault("flash_msgs", [])
+    st.session_state.flash_msgs.append({
+        "msg": message,
+        "type": kind
+    })
 # ==============
 # DB SETUP
 # ==============
@@ -35,24 +64,20 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-st.markdown(
-    """
-    <link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@300;400;500;700&display=swap" rel="stylesheet">
-    """,
-    unsafe_allow_html=True
-)
 
 # ==============
 # DATABASE MODELS
 # ==============
+DATABASE_URL = st.secrets.get(
+    "DATABASE_URL",
+    "sqlite:///expense.db"  # fallback for local use
+)
+
 engine = create_engine(
-    "sqlite:///expense.db",
-    connect_args={
-        "check_same_thread": False,
-        "timeout": 30
-    },
+    DATABASE_URL,
     pool_pre_ping=True
 )
+
 # ==============
 # SESSION LOCAL
 # ==============
@@ -68,81 +93,158 @@ def get_db():
 # ==============
 # MODELS
 # ==============
-Base = declarative_base()
-class Category(Base):
-    __tablename__ = "categories"
-    id = Column(Integer, primary_key=True)
-    name = Column(String, unique=True, nullable=False)
+Base = declarative_base()                                # base model
+class Category(Base):                                    # expense categories
+    __tablename__ = "categories"                         # categories table
+    id = Column(Integer, primary_key=True)               # unique category id
+    name = Column(String, unique=True, nullable=False)   # category name
 # ==============
 # SUBCATEGORY
 # ==============
-class SubCategory(Base):
-    __tablename__ = "subcategories"
-    id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False)
-    category_id = Column(Integer, ForeignKey("categories.id"))
-    __table_args__ = (UniqueConstraint("name", "category_id"),)
+class SubCategory(Base):                                          # subcategories          
+    __tablename__ = "subcategories"                               # subcategory table
+    id = Column(Integer, primary_key=True)                        # unique subcategory id
+    name = Column(String, nullable=False)                         # subcategory name
+    category_id = Column(Integer, ForeignKey("categories.id"))    # category id
+    __table_args__ = (UniqueConstraint("name", "category_id"),)   # unique constraint on (name, category_id)
 # ==============
 # EXPENSE
 # ==============
-class Expense(Base):
-    __tablename__ = "expenses"
-    id = Column(Integer, primary_key=True)
-    category_id = Column(Integer, ForeignKey("categories.id"), index=True)
-    subcategory_id = Column(Integer, ForeignKey("subcategories.id"), index=True)
-    date = Column(Date, nullable=False, index=True)
-    amount = Column(Float, nullable=False)
+class Expense(Base):                                                             # expense entries
+    __tablename__ = "expenses"                                                   # expense table
+    id = Column(Integer, primary_key=True)                                       # unique expense id
+    category_id = Column(Integer, ForeignKey("categories.id"), index=True)       # category id
+    subcategory_id = Column(Integer, ForeignKey("subcategories.id"), index=True) # subcategory id
+    date = Column(Date, nullable=False, index=True)                              # date of expense        
+    amount = Column(Float, nullable=False)                                       # expense amount
 # ==============
 # INCOME MODELS
 # ==============
-class IncomeCategory(Base):
-    __tablename__ = "income_categories"
-    id = Column(Integer, primary_key=True)
-    name = Column(String, unique=True, nullable=False)
-# ==============
+class IncomeCategory(Base):                                            # income categories
+    __tablename__ = "income_categories"                                # income category table
+    id = Column(Integer, primary_key=True)                             # unique category id
+    name = Column(String, unique=True, nullable=False)                 # income category name
+# ==================
 # INCOME SUBCATEGORY
-# ==============
-class IncomeSubCategory(Base):
-    __tablename__ = "income_subcategories"
-    id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False)
-    category_id = Column(Integer, ForeignKey("income_categories.id"))
-    __table_args__ = (UniqueConstraint("name", "category_id"),)
-# ==============
+# ==================
+class IncomeSubCategory(Base):                                         # income subcategories
+    __tablename__ = "income_subcategories"                             # income subcategory table
+    id = Column(Integer, primary_key=True)                             # unique subcategory id
+    name = Column(String, nullable=False)                              # subcategory name
+    category_id = Column(Integer, ForeignKey("income_categories.id"))  # income category id
+    __table_args__ = (UniqueConstraint("name", "category_id"),)        # unique constraint on (name, category_id)
+# =======
 # INCOME
-# ==============
-class Income(Base):
-    __tablename__ = "income"
+# =======
+class Income(Base):                                 # income entries
+    __tablename__ = "income"                        # income table
+    id = Column(Integer, primary_key=True)          # unique income id
+    category_id = Column(Integer, ForeignKey("income_categories.id"), index=True)        # income category id   
+    subcategory_id = Column(Integer, ForeignKey("income_subcategories.id"), index=True)  # income subcategory id
+    date = Column(Date, nullable=False, index=True) # date of income
+    amount = Column(Float, nullable=False)          # income amount
+
+# ============
+# ASSET MODELS
+# ============
+#----METAL ASSETS----
+class MetalAsset(Base):                          # metal assets
+    __tablename__ = "metal_assets"                # unique metal asset id
+    id = Column(Integer, primary_key=True)        # optional 
+    metal_type = Column(String, nullable=False)   # Gold / Silver
+    weight_grams = Column(Float, nullable=False)  # weight in grams
+    entry_date = Column(Date, nullable=False)     # date of purchase
+    created_at = Column(DateTime, default=datetime.datetime.utcnow) # created timestamp
+#----LAND ASSETS----
+class LandAsset(Base):
+    __tablename__ = "land_assets"
+    id = Column(Integer, primary_key=True)           # unique land asset id 
+    asset_id = Column(Integer, nullable=True)        # optional   
+    location = Column(String, nullable=False)        # "Area, City"
+    area_unit = Column(String, nullable=False)       # always "sqft"
+    area_size = Column(Float, nullable=False)        # sqft value
+    price_per_unit = Column(Float, nullable=True)    # optional
+# ----ASSET PRICES----
+class AssetPrice(Base):
+    __tablename__ = "asset_prices"           # asset prices
+    key = Column(String, primary_key=True)   # e.g. gold_price, land:Chennai
+    value = Column(Float, nullable=False)    # price value
+# ----FIXED DEPOSITS----
+class FixedDeposit(Base):                             # fixed deposit assets  
+    __tablename__ = "fixed_deposits"                  # unique FD table
+    id = Column(Integer, primary_key=True)            # unique FD id
+    name = Column(String, nullable=False)             # e.g. Bank Name / FD Scheme
+    principal = Column(Float, nullable=False)         # amount deposited
+    rate = Column(Float, nullable=False)              # annual %
+    tenure_months = Column(Integer, nullable=False)   # tenure in months      
+    deposit_date = Column(Date, nullable=False)       # date of deposit
+    maturity_date = Column(Date, nullable=False)      # date of maturity
+    status = Column(String, default="active")         # active | matured
+    created_at = Column(DateTime, default=datetime.datetime.utcnow) # created timestamp
+# ----APPLIANCES----
+class Appliance(Base):                                   # appliance assets      
+    __tablename__ = "appliances"                         # unique appliance id
+    id = Column(Integer, primary_key=True)               # optional
+    name = Column(String, nullable=False)                # e.g. Refrigerator        
+    price = Column(Float, nullable=False)                # purchase price
+    purchase_date = Column(Date, nullable=False)         # date of purchase
+    warranty_expiry = Column(Date, nullable=True)        # warranty expiry date
+    depreciation_years = Column(Integer, nullable=True)  # useful life in years
+# ----APPLIANCE IMAGES----
+class ApplianceImage(Base):                                  # images for appliances   
+    __tablename__ = "appliance_images"                       # unique image id
+    id = Column(Integer, primary_key=True)                   # optional
+    appliance_id = Column(Integer, ForeignKey("appliances.id", ondelete="CASCADE")) # appliance foreign key
+    image_path = Column(String, nullable=False)              # path to image file
+    appliance = relationship("Appliance", backref="images")  # relationship to Appliance
+# ======================
+# LIC POLICIES (SIMPLE)
+# ======================
+class LICPolicy(Base):
+    __tablename__ = "lic_policies"
+
     id = Column(Integer, primary_key=True)
-    category_id = Column(Integer, ForeignKey("income_categories.id"), index=True)
-    subcategory_id = Column(Integer, ForeignKey("income_subcategories.id"), index=True)
-    date = Column(Date, nullable=False, index=True)
-    amount = Column(Float, nullable=False)
-# ==============
-# DAILY HEALTH
-# ==============
-class DailyHealth(Base):
-    __tablename__ = "daily_health"
+    policy_name = Column(String, nullable=False)
+    premium_amount = Column(Float, nullable=False)
+    frequency = Column(String, nullable=False)  # Monthly / Quarterly / Half-Yearly / Yearly
+    last_premium_date = Column(Date, nullable=True)
+    maturity_date = Column(Date, nullable=False)
+    maturity_amount = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-    date = Column(Date, primary_key=True)
-    water = Column(Integer, default=0)        # Litres
-    sleep = Column(Float, default=0.0)         # hours
-    weight = Column(Float, default=0.0)        # kg
-# ==============
-# WORKOUT       
-# ==============
-class Workout(Base):
-    __tablename__ = "workouts"
+
+# ======================
+# INVESTMENTS (STOCK / MF / ETF)
+# ======================
+class Investment(Base):
+    __tablename__ = "investments"
 
     id = Column(Integer, primary_key=True)
-    date = Column(Date, nullable=False, index=True)
-    exercise = Column(String, nullable=False)
-    sets = Column(Integer, nullable=True)
-    reps = Column(Integer, nullable=True)
-    duration_min = Column(Float, nullable=True)
+    instrument = Column(String, nullable=False)      # Stock / MF / ETF
+    name = Column(String, nullable=False)            # TCS / NIFTY 50 / etc
+    units = Column(Float, nullable=False)
+    buy_price = Column(Float, nullable=False)
+    buy_date = Column(Date, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+Base.metadata.create_all(bind=engine)  # create tables
+def migrate_appliances_schema():                         # migrate appliances table schema   
+    with engine.connect() as conn:                       # connect to db
+        existing_cols = conn.execute(                    # get existing columns   
+            text("PRAGMA table_info(appliances)")        # pragma query   
+        ).fetchall()
+        existing_cols = {c[1] for c in existing_cols}    # set of column names
 
-Base.metadata.create_all(bind=engine)
+        if "warranty_expiry" not in existing_cols:       # if warranty_expiry not in cols   
+            conn.execute(
+                text("ALTER TABLE appliances ADD COLUMN warranty_expiry DATE") # alter table query
+            )
+        if "depreciation_years" not in existing_cols:    # if depreciation_years not in cols
+            conn.execute(
+                text("ALTER TABLE appliances ADD COLUMN depreciation_years INTEGER") # alter table query
+            )
+
+migrate_appliances_schema() # migrate appliances schema
 
 # ==============
 # CREATE TABLES
@@ -166,26 +268,17 @@ def load_expense_data(refresh_key):
             q.all(),
             columns=["date", "amount", "category", "subcategory"]
         )
-    
-# ==============
-# CUSTOM CSS
-# ==============
+
 st.markdown(
     """
     <style>
     /* ===============================
-       GLOBAL RESET
+       BASIC DARK THEME (SAFE)
     =============================== */
-    * {
-        box-shadow: none !important;
-    }
 
-    /* ===============================
-       APP + HEADER
-    =============================== */
     .stApp {
-        background-color: #000000 !important;
-        color: #ffffff !important;
+        background-color: #000000;
+        color: #ffffff;
     }
 
     header[data-testid="stHeader"] {
@@ -193,143 +286,293 @@ st.markdown(
     }
 
     div[data-testid="stToolbar"] {
-        background: #000000 !important;
+        background: #000000;
     }
 
     /* ===============================
        SIDEBAR
     =============================== */
     section[data-testid="stSidebar"] {
-        background-color: #000000 !important;
+        background-color: #000000;
         border-right: 1px solid #111111;
     }
 
     /* ===============================
-       ALL TEXT
-    =============================== */
-    html, body, [class*="css"] {
-        color: #ffffff !important;
-    }
-
-    /* ===============================
-       INPUTS / SELECT / DATE
+       INPUTS
     =============================== */
     input, textarea, select {
-        background-color: #000000 !important;
-        color: #ffffff !important;
-        border: 1px solid #222222 !important;
+        background-color: #000000;
+        color: #ffffff;
+        border: 1px solid #222222;
     }
 
     div[data-baseweb="select"] > div,
     div[data-baseweb="input"] > div,
     div[data-baseweb="datepicker"] > div {
-        background-color: #000000 !important;
-        border: 1px solid #222222 !important;
+        background-color: #000000;
+        border: 1px solid #222222;
     }
 
     /* ===============================
        BUTTONS
     =============================== */
     button {
-        background-color: #000000 !important;
-        color: #ffffff !important;
-        border: 1px solid #333333 !important;
+        background-color: #000000;
+        color: #ffffff;
+        border: 1px solid #333333;
+        transition: transform 0.08s ease;
     }
 
     button:hover {
-        background-color: #111111 !important;
+        background-color: #111111;
+    }
+
+    button:active {
+        transform: scale(0.97);
     }
 
     /* ===============================
-       METRICS / CARDS
+       METRICS (POP-IN ANIMATION)
     =============================== */
     div[data-testid="metric-container"] {
-        background-color: #000000 !important;
-        border: 1px solid #222222 !important;
+        background-color: #000000;
+        border: 1px solid #222222;
         border-radius: 12px;
+        animation: metric-pop 0.35s ease-out;
+    }
+
+    @keyframes metric-pop {
+        from {
+            transform: scale(0.96);
+            opacity: 0;
+        }
+        to {
+            transform: scale(1);
+            opacity: 1;
+        }
     }
 
     /* ===============================
-       DATAFRAMES / AGGRID
+       TABLES / AGGRID
     =============================== */
     .ag-theme-streamlit,
     .ag-root-wrapper {
-        background-color: #000000 !important;
-        color: #ffffff !important;
+        background-color: #000000;
+        color: #ffffff;
     }
 
     /* ===============================
-       PLOTLY
+       PLOTLY (FADE-IN)
     =============================== */
     .js-plotly-plot,
     .plotly {
-        background: #000000 !important;
+        background: #000000;
+        animation: fade-in 0.4s ease-in;
+    }
+
+    @keyframes fade-in {
+        from { opacity: 0; }
+        to { opacity: 1; }
     }
 
     /* ===============================
-       🔥 SIDEBAR DATE INPUT – HARD FIX
+       EXPANDER OPEN HIGHLIGHT
     =============================== */
-    /* ===============================
-    FIX SIDEBAR NAV DISAPPEARING
-    =============================== */
+    details[open] {
+        border-left: 3px solid #4da3ff;
+        padding-left: 8px;
+        transition: all 0.2s ease;
+    }
 
-    /* Hide ONLY date_input label */
+    /* ===============================
+       SIDEBAR DATE INPUT CLEANUP
+    =============================== */
     section[data-testid="stSidebar"] .stDateInput label {
-        display: none !important;
+        display: none;
     }
 
-    /* Tighten date input spacing */
-    section[data-testid="stSidebar"] div[data-testid="stDateInput"] {
-        margin-top: -10px !important;
-    }
-
-    /* Remove BaseWeb wrapper spacing */
-    section[data-testid="stSidebar"] div[data-testid="stDateInput"] {
-        padding-top: 0 !important;
-        margin-top: -14px !important;
-    }
-
-    /* Tighten inner input container */
-    section[data-testid="stSidebar"] div[data-baseweb="datepicker"] {
-        margin-top: 0 !important;
-        padding-top: 0 !important;
-    }
-
-    /* Ensure full width */
-    section[data-testid="stSidebar"] .stDateInput > div {
-        width: 100% !important;
-        margin-top: 0 !important;
-    }
-
-       /* ===============================
-    GLOBAL RESET
+    /* ===============================
+       🔒 CRITICAL FIX
+       Hide leaked Material icon text
     =============================== */
-    * {
-        box-shadow: none !important;
-        font-family: 'Ubuntu', sans-serif !important;
+    section[data-testid="stSidebar"]
+    span.material-symbols-outlined::before,
+    section[data-testid="stSidebar"]
+    span.material-icons::before {
+        font-size: 18px !important;
     }
 
-    html, body {
-        font-family: 'Ubuntu', sans-serif !important;
+    section[data-testid="stSidebar"]
+    span.material-symbols-outlined,
+    section[data-testid="stSidebar"]
+    span.material-icons {
+        font-size: 0 !important;
+    }
+    /* ===============================
+    PAGE TRANSITION (GLOBAL)
+    =============================== */
+    .stApp > div {
+        animation: page-enter 0.35s ease-out;
     }
 
-    h1, h2, h3, h4, h5, h6 {
-        font-family: 'Ubuntu', sans-serif !important;
-        font-weight: 700 !important;
+    @keyframes page-enter {
+        from {
+            opacity: 0;
+            transform: translateY(6px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
     }
 
-    section[data-testid="stSidebar"] * {
-        font-family: 'Ubuntu', sans-serif !important;
+    /* ===============================
+    SECTION / EXPANDER CONTENT REVEAL
+    =============================== */
+    details[open] > div {
+        animation: reveal 0.25s ease-out;
     }
 
-    div[data-testid="stDataFrame"] * {
-        font-family: 'Ubuntu', sans-serif !important;
+    @keyframes reveal {
+        from {
+            opacity: 0;
+            transform: translateY(4px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
     }
 
-    /* ---- KEEP ALL YOUR EXISTING DARK THEME CSS BELOW ---- */
-    /* (no changes needed there) */
-    p:has-text("keyboard_double_arrow_right") {
-    display: none !important;
+    /* ===============================
+    INPUTS (SELECTBOX / DROPDOWN / DATE)
+    =============================== */
+    div[data-baseweb="select"],
+    div[data-baseweb="input"],
+    div[data-baseweb="datepicker"] {
+        animation: input-rise 0.25s ease-out;
+    }
+
+    @keyframes input-rise {
+        from {
+            opacity: 0;
+            transform: translateY(3px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    }
+    /* ===============================
+    DIRECTION-AWARE PAGE TRANSITION
+    =============================== */
+
+    html[data-nav-direction="right"] .stApp > div {
+        animation: slide-from-right 0.35s ease-out;
+    }
+
+    html[data-nav-direction="left"] .stApp > div {
+        animation: slide-from-left 0.35s ease-out;
+    }
+
+    @keyframes slide-from-right {
+        from {
+            opacity: 0;
+            transform: translateX(12px);
+        }
+        to {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    }
+
+    @keyframes slide-from-left {
+        from {
+            opacity: 0;
+            transform: translateX(-12px);
+        }
+        to {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    }
+
+    /* ===============================
+    SWIPE-LIKE PAGE TRANSITION
+    =============================== */
+    html[data-nav-direction="right"] .stApp > div {
+        animation: swipe-left 0.38s cubic-bezier(.22,.61,.36,1);
+    }
+
+    html[data-nav-direction="left"] .stApp > div {
+        animation: swipe-right 0.38s cubic-bezier(.22,.61,.36,1);
+    }
+
+    @keyframes swipe-left {
+        from {
+            transform: translateX(100%);
+            opacity: 0.6;
+        }
+        to {
+            transform: translateX(0);
+            opacity: 1;
+        }
+    }
+
+    @keyframes swipe-right {
+        from {
+            transform: translateX(-100%);
+            opacity: 0.6;
+        }
+        to {
+            transform: translateX(0);
+            opacity: 1;
+        }
+    }
+
+    /* ===============================
+    ANIMATED BREADCRUMBS
+    =============================== */
+    .breadcrumb {
+        font-size: 14px;
+        color: #aaaaaa;
+        margin-bottom: 10px;
+        animation: crumb-slide 0.3s ease-out;
+    }
+
+    .breadcrumb span {
+        margin: 0 6px;
+        color: #555555;
+    }
+
+    @keyframes crumb-slide {
+        from {
+            opacity: 0;
+            transform: translateX(-6px);
+        }
+        to {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    }
+    /* ===============================
+    SAFE DROPDOWN ANIMATION (NO JUMP)
+    =============================== */
+
+    /* Target only the menu content, NOT the popover root */
+    div[data-baseweb="popover"] > div {
+        animation: dropdown-fade-slide 0.18s ease-out;
+    }
+
+    @keyframes dropdown-fade-slide {
+        from {
+            opacity: 0;
+            transform: translateY(-4px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
     }
 
     </style>
@@ -337,12 +580,140 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+if "flash_msgs" in st.session_state:
+    for msg in st.session_state.flash_msgs:
+        if msg["type"] == "success":
+            st.success(msg["msg"])
+        elif msg["type"] == "error":
+            st.error(msg["msg"])
+        elif msg["type"] == "info":
+            st.info(msg["msg"])
+    del st.session_state.flash_msgs
+
+# ==============
+# HELPER FUNCTIONS
+# ==============
+def section(title, desc):
+    st.subheader(title)
+    st.caption(desc)
+
+
+def cumulative_spend_chart(df):
+    section(
+        "📈 Cumulative Spending Curve",
+        "Shows how your total expenses accumulate over time. Useful to detect spending acceleration."
+    )
+
+    mode = st.radio(
+        "Aggregation Level",
+        ["Daily", "Monthly"],
+        horizontal=True,
+        key="cum_agg"
+    )
+
+    data = df.copy()
+
+    if mode == "Monthly":
+        data["period"] = data["date"].dt.to_period("M").dt.to_timestamp()
+        grp = data.groupby("period", as_index=False)["amount"].sum()
+        x = "period"
+    else:
+        grp = data.groupby("date", as_index=False)["amount"].sum()
+        x = "date"
+
+    grp["cumulative"] = grp["amount"].cumsum()
+
+    fig = px.line(grp, x=x, y="cumulative", markers=True)
+    fig.update_layout(
+    plot_bgcolor="#000000",
+    paper_bgcolor="#000000",
+    font=dict(color="white"),
+    xaxis=dict(gridcolor="#222222"),
+    yaxis=dict(gridcolor="#222222")
+)
+
+
+    st.plotly_chart(fig, use_container_width=True)
+    
+
+def advanced_analytics(period_df):
+
+    if period_df.empty:
+        st.info("No data available for selected period")
+        return
+
+    df = period_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+
+    # now call charts
+    cumulative_spend_chart(df)
+
+def get_price(db, key, default=0.0):
+    row = db.query(AssetPrice).filter(AssetPrice.key == key).first()
+    return row.value if row else default
+
+
+def set_price(db, key, value):
+    row = db.query(AssetPrice).filter(AssetPrice.key == key).first()
+    if row:
+        row.value = value
+    else:
+        db.add(AssetPrice(key=key, value=value))
+    db.commit()
+
+def fd_current_value(principal, rate, deposit_date):
+    days = (date.today() - deposit_date).days
+    years = max(days, 0) / 365
+    return principal * ((1 + rate / 100) ** years)
+
+
+def fd_maturity_value(principal, rate, tenure_months):
+    years = tenure_months / 12
+    return principal * ((1 + rate / 100) ** years)
+
+APPLIANCE_IMG_DIR = "appliance_images"
+os.makedirs(APPLIANCE_IMG_DIR, exist_ok=True)
+
+def open_image(path):
+    if not os.path.exists(path):
+        st.warning("Image not found")
+        return
+
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(path)
+    elif system == "Darwin":
+        subprocess.run(["open", path])
+    else:
+        subprocess.run(["xdg-open", path])
+
+def black_page(canvas, doc):
+    canvas.saveState()
+    canvas.setFillColor(colors.black)
+    canvas.rect(0, 0, doc.pagesize[0], doc.pagesize[1], stroke=0, fill=1)
+    canvas.restoreState()
+
+def is_edit_mode(aid):
+    return st.session_state.get(f"edit_mode_{aid}", False)
+
+def lic_simple_section():
+    st.subheader("📜 LIC Policies (Simple)")
+
+    with SessionLocal() as db:
+        st.info("LIC simple section loaded")
+def investment_section():
+    st.subheader("📈 Stock / MF / ETF Investments")
+
+    with SessionLocal() as db:
+        st.info("Investment section loaded")
+
 
 # ==============
 # ADD EXPENSE
 # ==============
 def add_expense():
-    st.title("➕ Add Expense")
+    st.markdown("## <span>➕</span> Add Expense", unsafe_allow_html=True)
     with SessionLocal() as db:
         # =================
         # ADD EXPENSE ENTRY
@@ -351,16 +722,32 @@ def add_expense():
         if not cats:
             st.warning("Please add categories first")
             return
-        cat_name = st.selectbox("Category", [c.name for c in cats])
+        col1, col2 = st.columns(2)
+
+        with col1:
+            cat_name = st.selectbox(
+                "Category",
+                [c.name for c in cats],
+                key="add_cat"
+            )
+
         cat = db.query(Category).filter_by(name=cat_name).first()
         if not cat:
             st.warning("Invalid category")
             return
+
         subs = db.query(SubCategory).filter_by(category_id=cat.id).all()
         if not subs:
             st.info("Please add subcategories first")
             return
-        sub_name = st.selectbox("Subcategory", [s.name for s in subs])
+
+        with col2:
+            sub_name = st.selectbox(
+                "Subcategory",
+                [s.name for s in subs],
+                key="add_sub"
+            )
+
         sub = db.query(SubCategory).filter_by(
             name=sub_name,
             category_id=cat.id
@@ -377,24 +764,24 @@ def add_expense():
                 ))
                 db.commit()
                 st.session_state.data_refresh += 1
-                st.success("Expense added ✅")
+                flash("Expense added ✅")
                 st.rerun()
             else:
                 st.error("Amount must be greater than 0")
         st.divider()
 
-    with st.expander("📂 Manage Expense Categories"):
+    with st.expander("⚙️ Advanced (Expense Category Management)"):
         manage_categories()
-
-    with st.expander("🧾 Manage Expense Entries"):
+    st.divider()
+    with st.expander("🔍 Filter Expense Entries (Edit / Delete)"):
         manage_entries()
+
 
 
 # ============
 # ADD INCOME
 # ============
 def income_section():
-    st.title("💰 Income")
     with SessionLocal() as db:
         # ================
         # ADD INCOME ENTRY
@@ -404,32 +791,42 @@ def income_section():
             st.warning("No income categories found. Use Advanced section to add.")
             cats = []
         st.subheader("➕ Add Income")
+
         if cats:
-            cat_name = st.selectbox(
-                "Select Income Category",
-                [c.name for c in cats],
-                key="add_income_cat_select"
-            )
+            col1, col2 = st.columns(2)
+
+            with col1:
+                cat_name = st.selectbox(
+                    "Select Income Category",
+                    [c.name for c in cats],
+                    key="add_income_cat"
+                )
+
             cat = db.query(IncomeCategory).filter_by(name=cat_name).first()
+
             subs = db.query(IncomeSubCategory).filter_by(
                 category_id=cat.id
             ).all()
-            if not subs:
-                st.info("Add income subcategories first (Advanced section)")
-                sub = None
-            else:
-                sub_name = st.selectbox(
-                    "Select Income Subcategory",
-                    [s.name for s in subs],
-                    key="add_income_sub_select"
-                )
-                sub = db.query(IncomeSubCategory).filter_by(
-                    name=sub_name,
-                    category_id=cat.id
-                ).first()
+
+            with col2:
+                if not subs:
+                    st.info("Add income subcategories first (Advanced section)")
+                    sub = None
+                else:
+                    sub_name = st.selectbox(
+                        "Select Income Subcategory",
+                        [s.name for s in subs],
+                        key="add_income_sub"
+                    )
+                    sub = db.query(IncomeSubCategory).filter_by(
+                        name=sub_name,
+                        category_id=cat.id
+                    ).first()
         else:
             sub = None
-        
+
+
+   
         # ======    
         # INPUTS
         # ======
@@ -451,7 +848,7 @@ def income_section():
                 ))
                 db.commit()
                 st.session_state.data_refresh += 1
-                st.success("Income added ✅")
+                flash("Income added ✅")
                 st.rerun()
         # =================
         # INCOME DASHBOARD
@@ -548,6 +945,7 @@ def income_section():
             if not cat_pie.empty:
                 fig_cat = px.pie(cat_pie, names="category", values="amount", hole=0.4)
                 fig_cat.update_layout(paper_bgcolor="#000", font=dict(color="#fff"))
+                fig_cat.update_traces(marker=dict(line=dict(color="black", width=2)))
                 st.plotly_chart(fig_cat, use_container_width=True)
 
         with col2:
@@ -556,11 +954,13 @@ def income_section():
             if not sub_pie.empty:
                 fig_sub = px.pie(sub_pie, names="subcategory", values="amount", hole=0.4)
                 fig_sub.update_layout(paper_bgcolor="#000", font=dict(color="#fff"))
+                fig_sub.update_traces(marker=dict(line=dict(color="black", width=2)))
                 st.plotly_chart(fig_sub, use_container_width=True)
 
         # =====================
         # MANAGE INCOME ENTRIES
         # =====================
+        st.divider()
         with st.expander("🔍 Filter Income Entries (Edit / Delete)"):
             f_cat = st.selectbox(
                 "Filter by Category",
@@ -626,7 +1026,7 @@ def income_section():
                             inc.category_id = cat_obj.id
                             inc.subcategory_id = sub_obj.id
                     db.commit()
-                    st.success("Income entries updated successfully")
+                    flash("Income entries updated successfully")
                     st.rerun()
             elif action_mode == "Delete Income Entries":
                 del_df = filtered_df.copy()
@@ -652,7 +1052,7 @@ def income_section():
                                     db.delete(inc)
                             db.commit()
                             st.session_state.data_refresh += 1
-                            st.success("Selected income entries deleted")
+                            flash("Selected income entries deleted")
                             st.rerun()
         # ===================================
         # ADVANCED INCOME CATEGORY MANAGEMENT
@@ -674,7 +1074,7 @@ def income_section():
                     db.add(IncomeCategory(name=new_cat.strip()))
                     db.commit()
                     st.session_state.data_refresh += 1
-                    st.success("Income category added")
+                    flash("Income category added")
                     st.rerun()
             income_cats = db.query(IncomeCategory).all()
             if not income_cats:
@@ -711,7 +1111,7 @@ def income_section():
                     )
                     db.commit()
                     st.session_state.data_refresh += 1
-                    st.success("Income subcategory added")
+                    flash("Income subcategory added")
                     st.rerun()
 
             # ====================================
@@ -738,7 +1138,7 @@ def income_section():
                         sel_cat.name = new_cat_name.strip()
                         db.commit()
                         st.session_state.data_refresh += 1
-                        st.success("Income category renamed")
+                        flash("Income category renamed")
                         st.rerun()
             # =========================
             # RENAME INCOME SUBCATEGORY
@@ -772,7 +1172,7 @@ def income_section():
                         sub_obj.name = new_sub_name.strip()
                         db.commit()
                         st.session_state.data_refresh += 1
-                        st.success("Income subcategory renamed")
+                        flash("Income subcategory renamed")
                         st.rerun()
             else:
                 st.info("No subcategories available")
@@ -800,7 +1200,7 @@ def income_section():
                         db.delete(del_sub)
                         db.commit()
                         st.session_state.data_refresh += 1
-                        st.success("Income subcategory deleted")
+                        flash("Income subcategory deleted")
                         st.rerun()
             # ======================
             # DELETE INCOME CATEGORY
@@ -826,8 +1226,195 @@ def income_section():
                     db.delete(del_cat)
                     db.commit()
                     st.session_state.data_refresh += 1
-                    st.success(f"Income category '{del_cat.name}' deleted")
+                    flash(f"Income category '{del_cat.name}' deleted")
                     st.rerun()
+        # =====================================================
+        # 📄 INCOME PDF EXPORT (ADVANCED – BLACK THEME)
+        # =====================================================
+        st.divider()
+
+        with st.expander("⬇️ Export Income to PDF", expanded=False):
+
+            # -------------------------------
+            # LOAD FULL INCOME DATA
+            # -------------------------------
+            income_df = pd.DataFrame(
+                db.query(
+                    Income.id,
+                    Income.date,
+                    Income.amount,
+                    IncomeCategory.name.label("category"),
+                    IncomeSubCategory.name.label("subcategory")
+                )
+                .join(IncomeCategory, Income.category_id == IncomeCategory.id)
+                .join(IncomeSubCategory, Income.subcategory_id == IncomeSubCategory.id)
+                .all(),
+                columns=["NOs", "date", "amount", "category", "subcategory"]
+            )
+
+            if income_df.empty:
+                st.info("No income data available for export.")
+                st.stop()
+
+            income_df["date"] = pd.to_datetime(income_df["date"])
+
+            # -------------------------------
+            # FILTERS
+            # -------------------------------
+            st.markdown("### 🔍 Filters")
+
+            c1, c2, c3 = st.columns(3)
+
+            with c1:
+                period_type = st.selectbox(
+                    "Period Type",
+                    ["All", "Monthly", "Yearly", "Custom Range"]
+                )
+
+            with c2:
+                categories = ["All"] + sorted(income_df["category"].unique())
+                sel_category = st.selectbox("Category", categories)
+
+            with c3:
+                if sel_category == "All":
+                    subcats = ["All"]
+                else:
+                    subcats = ["All"] + sorted(
+                        income_df[income_df["category"] == sel_category]["subcategory"].unique()
+                    )
+                sel_subcategory = st.selectbox("Subcategory", subcats)
+
+            today = datetime.date.today()
+
+            if period_type == "Monthly":
+                months = sorted(income_df["date"].dt.to_period("M").unique())
+                month_labels = [m.strftime("%b %Y") for m in months]
+                sel_month = st.selectbox("Select Month", month_labels)
+                period = months[month_labels.index(sel_month)]
+                start_date = period.to_timestamp()
+                end_date = (period + 1).to_timestamp() - pd.Timedelta(seconds=1)
+
+            elif period_type == "Yearly":
+                years = sorted(income_df["date"].dt.year.unique())
+                sel_year = st.selectbox("Select Year", years)
+                start_date = pd.Timestamp(sel_year, 1, 1)
+                end_date = pd.Timestamp(sel_year, 12, 31)
+
+            elif period_type == "Custom Range":
+                start_date, end_date = st.date_input(
+                    "Date Range",
+                    [today.replace(day=1), today]
+                )
+                start_date = pd.to_datetime(start_date)
+                end_date = pd.to_datetime(end_date)
+
+            else:
+                start_date = income_df["date"].min()
+                end_date = income_df["date"].max()
+
+            # -------------------------------
+            # APPLY FILTERS
+            # -------------------------------
+            fdf = income_df[income_df["date"].between(start_date, end_date)]
+
+            if sel_category != "All":
+                fdf = fdf[fdf["category"] == sel_category]
+
+            if sel_subcategory != "All":
+                fdf = fdf[fdf["subcategory"] == sel_subcategory]
+
+            if fdf.empty:
+                st.warning("No income found for selected filters.")
+                st.stop()
+
+            # -------------------------------
+            # GENERATE PDF
+            # -------------------------------
+            if st.button("🧾 Generate Income PDF Report"):
+
+                buffer = BytesIO()
+                doc = SimpleDocTemplate(buffer, pagesize=A4)
+
+                styles = getSampleStyleSheet()
+                styles.add(ParagraphStyle(
+                    name="WhiteNormal",
+                    fontName="DejaVu",
+                    fontSize=10,
+                    textColor=colors.white
+                ))
+                styles.add(ParagraphStyle(
+                    name="WhiteHeading",
+                    fontName="DejaVu",
+                    fontSize=14,
+                    textColor=colors.white,
+                    spaceAfter=10
+                ))
+                styles.add(ParagraphStyle(
+                    name="WhiteTitle",
+                    fontName="DejaVu",
+                    fontSize=18,
+                    textColor=colors.white,
+                    spaceAfter=14
+                ))
+
+                story = []
+
+                # ---------- TITLE ----------
+                story.append(Paragraph("Income Report", styles["WhiteTitle"]))
+                story.append(Paragraph(
+                    f"Generated on: {datetime.date.today()}",
+                    styles["WhiteNormal"]
+                ))
+                story.append(Spacer(1, 12))
+
+                # ---------- TABLE ----------
+                fdf["date"] = fdf["date"].dt.strftime("%Y-%m-%d")
+                fdf["amount"] = fdf["amount"].round(2)
+
+                total_income = fdf["amount"].sum()
+
+                table_data = [list(fdf.columns)] + fdf.values.tolist()
+                table_data.append(["", "", "TOTAL", "", f"{total_income:,.2f}"])
+
+                table = Table(table_data, repeatRows=1)
+                table.setStyle(TableStyle([
+                    ("FONT", (0,0), (-1,-1), "DejaVu"),
+                    ("BACKGROUND", (0,0), (-1,0), colors.black),
+                    ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+                    ("BACKGROUND", (0,1), (-1,-2), colors.black),
+                    ("TEXTCOLOR", (0,1), (-1,-1), colors.white),
+                    ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+                    ("BACKGROUND", (-2,-1), (-1,-1), colors.black),
+                ]))
+
+                story.append(table)
+
+                story.append(Spacer(1, 20))
+                story.append(Paragraph(
+                    f"GRAND TOTAL INCOME: ₹ {total_income:,.2f}",
+                    styles["WhiteHeading"]
+                ))
+
+                # ---------- BLACK PAGE BACKGROUND ----------
+                def black_bg(canvas, doc):
+                    canvas.saveState()
+                    canvas.setFillColor(colors.black)
+                    canvas.rect(0, 0, doc.pagesize[0], doc.pagesize[1], fill=1)
+                    canvas.restoreState()
+
+                doc.build(
+                    story,
+                    onFirstPage=black_bg,
+                    onLaterPages=black_bg
+                )
+
+                st.download_button(
+                    "⬇️ Download Income PDF",
+                    data=buffer.getvalue(),
+                    file_name="income_report.pdf",
+                    mime="application/pdf"
+                )
+    
 
 
 # ====================
@@ -853,7 +1440,7 @@ def manage_categories():
                 db.add(Category(name=new_cat.strip()))
                 db.commit()
                 st.session_state.data_refresh += 1
-                st.success("Category added")
+                flash("Category added")
                 st.rerun()
         # =================
         # MANAGE EXISTING
@@ -885,7 +1472,7 @@ def manage_categories():
                 cat.name = new_cat_name.strip()
                 db.commit()
                 st.session_state.data_refresh += 1
-                st.success("Category renamed")
+                flash("Category renamed")
                 st.rerun()
         st.divider()
         # =================     
@@ -908,7 +1495,7 @@ def manage_categories():
                 db.add(SubCategory(name=new_sub.strip(), category_id=cat.id))
                 db.commit()
                 st.session_state.data_refresh += 1
-                st.success("Subcategory added")
+                flash("Subcategory added")
                 st.rerun()
         if not subs:
             st.info("No subcategories available")
@@ -932,7 +1519,7 @@ def manage_categories():
             if not new_sub_name.strip():
                 st.error("Subcategory name cannot be empty")
             elif db.query(SubCategory).filter_by(
-                name=new_sub_name,
+                name=new_sub_name,  
                 category_id=cat.id
             ).first():
                 st.error("Subcategory already exists in this category")
@@ -940,7 +1527,7 @@ def manage_categories():
                 sub_obj.name = new_sub_name.strip()
                 db.commit()
                 st.session_state.data_refresh += 1
-                st.success("Subcategory renamed")
+                flash("Subcategory renamed")
                 st.rerun()
         st.divider()
         # =================
@@ -979,7 +1566,7 @@ def manage_categories():
                 )
                 db.commit()
                 st.session_state.data_refresh += 1
-                st.success(
+                flash(
                     f"'{sub_obj.name}' moved to '{target_cat.name}' "
                     "and past expenses updated"
                 )
@@ -1008,7 +1595,7 @@ def manage_categories():
                     db.delete(sub)
                     db.commit()
                     st.session_state.data_refresh += 1
-                    st.success("Subcategory deleted")
+                    flash("Subcategory deleted")
                     st.rerun()
             st.divider()
             # ==================
@@ -1023,7 +1610,7 @@ def manage_categories():
                     db.delete(cat)
                     db.commit()
                     st.session_state.data_refresh += 1
-                    st.success("Category deleted")
+                    flash("Category deleted")
                     st.rerun()
 
 # ===============
@@ -1152,7 +1739,7 @@ def manage_entries():
                             exp.subcategory_id = sub.id
                 db.commit()
                 st.session_state.data_refresh += 1
-                st.success("Entries updated successfully")
+                flash("Entries updated successfully")
                 st.rerun()
         else:
             st.subheader("🗑 Delete Entries")
@@ -1185,7 +1772,7 @@ def manage_entries():
                                     db.delete(exp)
                             db.commit()
                             st.session_state.data_refresh += 1
-                            st.success("Selected entries deleted")
+                            flash("Selected entries deleted")
                             st.rerun()
             else:
                 st.warning(f"This will delete ALL {len(df)} filtered entries")
@@ -1197,7 +1784,7 @@ def manage_entries():
                                 db.delete(exp)
                         db.commit()
                         st.session_state.data_refresh += 1
-                        st.success("All filtered entries deleted")
+                        flash("All filtered entries deleted")
                         st.rerun()
 
 def dashboard():
@@ -1328,11 +1915,6 @@ def dashboard():
             .scalar()
         ) or 0
 
-        month_expense = (
-            db.query(func.sum(Expense.amount))
-            .filter(Expense.date.between(month_start_ts.date(), today_date))
-            .scalar()
-        ) or 0
 
         year_expense = (
             db.query(func.sum(Expense.amount))
@@ -1342,8 +1924,7 @@ def dashboard():
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Last 7 Days", f"₹ {week_expense:,.2f}")
-        c2.metric("This Month", f"₹ {month_expense:,.2f}")
-        c3.metric("Year So Far", f"₹ {year_expense:,.2f}")
+        c2.metric("Year So Far", f"₹ {year_expense:,.2f}")
 
     # ============================
     # PERIOD FILTER (CHARTS)
@@ -1458,6 +2039,7 @@ def dashboard():
             paper_bgcolor="#000",
             font=dict(color="#fff")
         )
+        fig_cat.update_traces(marker=dict(line=dict(color="black", width=2)))
 
         st.plotly_chart(fig_cat, use_container_width=True)
 
@@ -1498,7 +2080,7 @@ def dashboard():
                 fig_sub.update_traces(
                     texttemplate="%{customdata}%",
                     customdata=sub_df["percent"],
-                    hovertemplate="<b>%{label}</b><br>₹ %{value:,.0f}<br>%{customdata}%<extra></extra>"
+                    hovertemplate="<b>%{label}</b><br>₹ %{value:,.0f}<br>%{customdata}%<extra></extra>",
                 )
 
                 fig_sub.update_layout(
@@ -1516,6 +2098,7 @@ def dashboard():
                     paper_bgcolor="#000",
                     font=dict(color="#fff")
                 )
+                fig_sub.update_traces(marker=dict(line=dict(color="black", width=2)))
 
                 st.plotly_chart(fig_sub, use_container_width=True)
 
@@ -1536,9 +2119,11 @@ def dashboard():
                     font=dict(color="#fff"),
                     xaxis=dict(tickangle=-45)
                 )
-
+                fig_bar.update_traces(marker=dict(line=dict(color="black", width=2)))
+                fig_bar.update_traces(marker=dict(line=dict(color="black", width=2)))
                 st.plotly_chart(fig_bar, use_container_width=True)
-        # ============================
+                
+    # ============================
     # BAR → TRANSACTION TABLE
     # ============================
     if chart_view == "Bar Chart" and not sub_df.empty:
@@ -1577,206 +2162,109 @@ def dashboard():
             )
 
 
+    st.divider()
+    advanced_analytics(period_df)
+
     # ============================
     # SUBCATEGORY DETAILS TABLE
     # ============================
-    st.divider()
-    st.subheader("📋 Subcategory Details")
+    with st.expander("🔎 View Subcategory Details Table", expanded=False):
 
-    # ---- Select subcategory (based on selected category)
-    available_subs = sorted(
-        period_df[period_df["category"] == selected_category]["subcategory"].unique()
-    )
+        st.subheader("📋 Subcategory Details")
 
-    if not available_subs:
-        st.info("No subcategories available")
-        return
-
-    selected_subcategory = st.selectbox(
-        "Select Subcategory",
-        available_subs,
-        key="subcategory_table_select"
-    )
-
-    # ---- Time filter
-    time_filter = st.radio(
-        "Filter by",
-        ["Monthly", "Last 7 Days", "Custom"],
-        horizontal=True,
-        key="subcategory_time_filter"
-    )
-
-    today_ts = pd.Timestamp.today().normalize()
-
-    if time_filter == "Monthly":
-        months = sorted(df["date"].dt.to_period("M").unique())
-        labels = [m.strftime("%b %Y") for m in months]
-
-        current_period = today_ts.to_period("M")
-        default_index = (
-            months.index(current_period)
-            if current_period in months
-            else len(months) - 1
+        # ---- Select subcategory (based on selected category)
+        available_subs = sorted(
+            period_df[period_df["category"] == selected_category]["subcategory"].unique()
         )
 
-        sel = st.selectbox(
-            "Select Month",
-            labels,
-            index=default_index,
-            key="subcategory_month_select"
+        if not available_subs:
+            st.info("No subcategories available")
+            return
+
+        selected_subcategory = st.selectbox(
+            "Select Subcategory",
+            available_subs,
+            key="subcategory_table_select"
         )
 
-        sel_period = months[labels.index(sel)]
-        start_ts = sel_period.to_timestamp()
-        end_ts = (sel_period + 1).to_timestamp() - pd.Timedelta(seconds=1)
-
-    elif time_filter == "Last 7 Days":
-        end_ts = today_ts
-        start_ts = today_ts - pd.Timedelta(days=6)
-
-    else:
-        start, end = st.date_input(
-            "Select date range",
-            [today_ts.date() - pd.Timedelta(days=7), today_ts.date()],
-            key="subcategory_custom_range"
-        )
-        start_ts = pd.Timestamp(start)
-        end_ts = pd.Timestamp(end)
-
-    # ---- Filter data
-    table_df = df[
-        (df["category"] == selected_category) &
-        (df["subcategory"] == selected_subcategory) &
-        (df["date"].between(start_ts, end_ts))
-    ][["date", "subcategory", "amount"]]
-
-    if table_df.empty:
-        st.warning("No records found for this selection")
-    else:
-        table_df = table_df.sort_values("date")
-
-        # Rename columns
-        table_df = table_df.rename(columns={
-            "date": "Date",
-            "subcategory": "Subcategory",
-            "amount": "Amount (₹)"
-        })
-
-        # Display table
-        st.dataframe(
-            table_df,
-            use_container_width=True,
-            hide_index=True
+        # ---- Time filter
+        time_filter = st.radio(
+            "Filter by",
+            ["Monthly", "Last 7 Days", "Custom"],
+            horizontal=True,
+            key="subcategory_time_filter"
         )
 
-        # Total
-        total_value = table_df["Amount (₹)"].sum()
-        st.metric(
-            "Total",
-            f"₹ {total_value:,.2f}"
-        )
+        today_ts = pd.Timestamp.today().normalize()
 
+        if time_filter == "Monthly":
+            months = sorted(df["date"].dt.to_period("M").unique())
+            labels = [m.strftime("%b %Y") for m in months]
 
-    # ============================
-    # WEEKLY TREND (SMART & SCALABLE)
-    # ============================
-
-    # Prepare full daily trend
-    trend_df = (
-        df.assign(day=lambda x: x["date"].dt.date)
-        .groupby("day", as_index=False)["amount"]
-        .sum()
-        .sort_values("day")
-    )
-
-    if trend_df.empty:
-        st.caption("No data available")
-        return
-
-    # ----------------------------
-    # Adaptive aggregation
-    # ----------------------------
-    days_span = (trend_df["day"].max() - trend_df["day"].min()).days
-
-    if days_span <= 14:
-        plot_df = trend_df
-    elif days_span <= 90:
-        plot_df = (
-            trend_df
-            .assign(week=lambda x: pd.to_datetime(x["day"]).dt.to_period("W").dt.start_time)
-            .groupby("week", as_index=False)["amount"]
-            .sum()
-            .rename(columns={"week": "day"})
-        )
-    else:
-        plot_df = (
-            trend_df
-            .assign(month=lambda x: pd.to_datetime(x["day"]).dt.to_period("M").dt.start_time)
-            .groupby("month", as_index=False)["amount"]
-            .sum()
-            .rename(columns={"month": "day"})
-        )
-
-    # ----------------------------
-    # UI container
-    # ----------------------------
-    st.markdown('<div class="weekly-trend-box">', unsafe_allow_html=True)
-
-    header_col, btn_col = st.columns([6, 1])
-    header_col.markdown("📈 **Spending Trend**")
-
-    if btn_col.button(
-        "➖" if st.session_state.show_weekly_trend else "➕",
-        key="weekly_toggle"
-    ):
-        st.session_state.show_weekly_trend = not st.session_state.show_weekly_trend
-
-    # ----------------------------
-    # Plot
-    # ----------------------------
-    if st.session_state.show_weekly_trend:
-
-        y_max = max(plot_df["amount"].max() * 1.1, 100)
-
-        fig = px.line(
-            plot_df,
-            x="day",
-            y="amount",
-            markers=True
-        )
-
-        fig.update_layout(
-            height=220,
-            paper_bgcolor="#000",
-            plot_bgcolor="#000",
-            font=dict(color="#fff"),
-            xaxis_title=None,
-            yaxis_title=None,
-
-            # Never allow negative Y
-            yaxis=dict(
-                range=[0, y_max],
-                fixedrange=False
-            ),
-
-            # Allow horizontal pan
-            xaxis=dict(
-                type="date",
-                fixedrange=False
+            current_period = today_ts.to_period("M")
+            default_index = (
+                months.index(current_period)
+                if current_period in months
+                else len(months) - 1
             )
-        )
 
-        # Default focus → last 7 days
-        fig.update_xaxes(
-            range=[
-                trend_df["day"].max() - pd.Timedelta(days=7),
-                trend_df["day"].max()
-            ]
-        )
+            sel = st.selectbox(
+                "Select Month",
+                labels,
+                index=default_index,
+                key="subcategory_month_select"
+            )
 
-        st.plotly_chart(fig, use_container_width=True)
+            sel_period = months[labels.index(sel)]
+            start_ts = sel_period.to_timestamp()
+            end_ts = (sel_period + 1).to_timestamp() - pd.Timedelta(seconds=1)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        elif time_filter == "Last 7 Days":
+            end_ts = today_ts
+            start_ts = today_ts - pd.Timedelta(days=6)
+
+        else:
+            start, end = st.date_input(
+                "Select date range",
+                [today_ts.date() - pd.Timedelta(days=7), today_ts.date()],
+                key="subcategory_custom_range"
+            )
+            start_ts = pd.Timestamp(start)
+            end_ts = pd.Timestamp(end)
+
+        # ---- Filter data
+        table_df = df[
+            (df["category"] == selected_category) &
+            (df["subcategory"] == selected_subcategory) &
+            (df["date"].between(start_ts, end_ts))
+        ][["date", "subcategory", "amount"]]
+
+        if table_df.empty:
+            st.warning("No records found for this selection")
+        else:
+            table_df = table_df.sort_values("date")
+
+            # Rename columns
+            table_df = table_df.rename(columns={
+                "date": "Date",
+                "subcategory": "Subcategory",
+                "amount": "Amount (₹)"
+            })
+
+            # Display table
+            st.dataframe(
+                table_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # Total
+            total_value = table_df["Amount (₹)"].sum()
+            st.metric(
+                "Total",
+                f"₹ {total_value:,.2f}"
+            )
+
 
 
 
@@ -1913,7 +2401,7 @@ def insights():
     pct = (diff / prev_month) * 100 if prev_month != 0 else 0
     direction = "higher" if diff > 0 else "lower"
     arrow = "🔺" if diff > 0 else "🔻"
-    st.success(
+    flash(
         f"""
         {arrow} You spent **₹ {abs(diff):,.2f} ({abs(pct):.1f}%)**
         **{direction}** on **{sel_cat} → {sel_sub}**
@@ -1921,12 +2409,10 @@ def insights():
         """
     )
 
-# ====================================================
-# EXPORT
-# ====================================================
-# ===================
+
+# ================
 # PDF EXPORT FUNCTION
-# ===================
+# ================
 def export_pdf(df, footer_text=""):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -1957,7 +2443,7 @@ def export_pdf(df, footer_text=""):
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.black),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONT", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONT", (0, 0), (-1, 0), "DejaVu"),
         ("BACKGROUND", (0, 1), (-1, -1), colors.black),
         ("TEXTCOLOR", (0, 1), (-1, -1), colors.white),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.white),
@@ -1996,16 +2482,6 @@ def export_pdf(df, footer_text=""):
     )
     buffer.seek(0)
     return buffer   
-# ==========================
-# Black background for pages
-# ==========================
-def black_page(canvas, doc):
-    canvas.saveState()
-    canvas.setFillColor(colors.black)
-    canvas.rect(0, 0, doc.pagesize[0], doc.pagesize[1], stroke=0, fill=1)
-    canvas.restoreState()
-
-
 # ================
 # EXPORT DATA
 # ================
@@ -2282,765 +2758,1293 @@ def export_data():
                     mime="application/pdf"
                 )
 
-
-
-# ======================
-# WORKOUT TRENDS DATAFRAME  
-# ======================
-def get_workout_trend_df(start, end):
-    with SessionLocal() as db:
-        df = pd.DataFrame(
-            db.query(
-                Workout.date,
-                Workout.exercise,
-                Workout.sets,
-                Workout.reps,
-                Workout.duration_min
-            )
-            .filter(Workout.date.between(start, end))
-            .all(),
-            columns=["date", "exercise", "sets", "reps", "duration"]
-        )
-
-    if df.empty:
-        return df
-
-    df["date"] = pd.to_datetime(df["date"])
-
-    # reps-based volume
-    df["total_reps"] = (
-        df["sets"].fillna(0) * df["reps"].fillna(0)
-    )
-
-    return df
-
-
-# ======================
-# HABIT SECTIONS
-# ======================
-def habit_dashboard():
-    st.title("🧠 Habit Dashboard")
-
-    today = pd.Timestamp.today().normalize()
-
-    # =========================
-    # DAILY HEALTH – TODAY
-    # =========================
-    st.subheader("📅 Today · Daily Health")
+# ===========
+# ASSETS PAGE
+# ===========
+def assets_page():
+    st.title("🏦 Assets")
 
     with SessionLocal() as db:
-        dh = db.get(DailyHealth, today.date())
+        st.markdown('<div id="asset-inputs"></div>', unsafe_allow_html=True)
+        with st.expander("⚙️ Asset Valuation Inputs", expanded=False):
 
-    c1, c2, c3 = st.columns(3)
+            # =====================================================
+            # DASHBOARD – CALCULATIONS ONLY
+            # =====================================================
 
-    if dh:
-        c1.metric("💧 Water", f"{dh.water} glasses")
-        c2.metric("😴 Sleep", f"{dh.sleep} hrs")
-        c3.metric("⚖️ Weight", f"{dh.weight} kg")
-    else:
-        c1.metric("💧 Water", "—")
-        c2.metric("😴 Sleep", "—")
-        c3.metric("⚖️ Weight", "—")
+            # ---------- METALS ----------
+            gold_grams = db.query(func.sum(MetalAsset.weight_grams))\
+                .filter(MetalAsset.metal_type == "Gold").scalar() or 0
 
-    # =========================
-    # WORKOUT SUMMARY
-    # =========================
-    # =========================
-    # WORKOUT TRENDS
-    # =========================
-    st.divider()
-    st.subheader("🏋️ Workout Trends")
+            silver_grams = db.query(func.sum(MetalAsset.weight_grams))\
+                .filter(MetalAsset.metal_type == "Silver").scalar() or 0
 
-    today = pd.Timestamp.today().normalize()
+            gold_price = get_price(db, "gold_price", 0.0)
+            silver_price = get_price(db, "silver_price", 0.0)
 
-    # -------------------------
-    # LOAD ALL WORKOUT DATA FIRST
-    # -------------------------
-    with SessionLocal() as db:
-        df = pd.DataFrame(
-            db.query(
-                Workout.date,
-                Workout.exercise,
-                Workout.sets,
-                Workout.reps,
-                Workout.duration_min
-            ).all(),
-            columns=["date", "exercise", "sets", "reps", "duration"]
-        )
+            gold_value = gold_grams * gold_price
+            silver_value = silver_grams * silver_price
+            metal_total = gold_value + silver_value
 
-    if df.empty:
-        st.info("No workout data available")
-        return
-
-    df["date"] = pd.to_datetime(df["date"])
-    df["total_reps"] = df["sets"].fillna(0) * df["reps"].fillna(0)
-
-    # -------------------------
-    # PERIOD FILTER
-    # -------------------------
-    period = st.radio(
-        "Period",
-        ["Weekly", "Monthly", "Custom"],
-        horizontal=True,
-        key="workout_trend_period"
-    )
-
-    if period == "Weekly":
-        start = today - pd.Timedelta(days=6)
-        end = today
-
-    elif period == "Monthly":
-        months = sorted(df["date"].dt.to_period("M").unique())
-        month_labels = [m.strftime("%b %Y") for m in months]
-
-        selected_label = st.selectbox(
-            "Select Month",
-            month_labels,
-            key="workout_trend_month"
-        )
-
-        selected_period = months[month_labels.index(selected_label)]
-        start = selected_period.to_timestamp()
-        end = (selected_period + 1).to_timestamp() - pd.Timedelta(seconds=1)
-
-    else:
-        start, end = st.date_input(
-            "Select date range",
-            [today - pd.Timedelta(days=7), today],
-            key="workout_trend_custom"
-        )
-        start = pd.Timestamp(start)
-        end = pd.Timestamp(end)
-
-    # -------------------------
-    # APPLY DATE FILTER
-    # -------------------------
-    df = df[df["date"].between(start, end)]
-
-    if df.empty:
-        st.info("No workout data for selected period")
-        return
-
-    # -------------------------
-    # SPLIT WORKOUT TYPES
-    # -------------------------
-    reps_exercises = [
-        "Push-ups",
-        "Squats",
-        "Bicep Curls",
-        "Tricep Pushbacks",
-        "Handgrip"
-    ]
-
-    time_exercises = [
-        "Walking",
-        "Step Climbing",
-        "Plank"
-    ]
-
-    # =========================
-    # REPS-BASED TREND
-    # =========================
-    st.markdown("### 🔢 Reps-Based Workouts")
-
-    reps_df = (
-        df[df["exercise"].isin(reps_exercises)]
-        .groupby(["date", "exercise"], as_index=False)["total_reps"]
-        .sum()
-    )
-
-    if reps_df.empty:
-        st.info("No reps-based workouts in this period")
-    else:
-        reps_df["date_only"] = reps_df["date"].dt.date
-
-        fig = px.line(
-            reps_df.assign(date_only=reps_df["date"].dt.date),
-            x="date_only",
-            y="total_reps",
-            color="exercise",
-            markers=True
-        )
-
-        fig.update_layout(
-            height=320,
-            paper_bgcolor="#000",
-            plot_bgcolor="#000",
-            font=dict(color="#fff"),
-            yaxis_title="Total Reps",
-            xaxis_title="Date",
-            xaxis_tickformat="%d %b"
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-
-    # =========================
-    # TIME-BASED TREND
-    # =========================
-    st.markdown("### ⏱ Time-Based Workouts")
-
-    time_df = (
-        df[df["exercise"].isin(time_exercises)]
-        .groupby(["date", "exercise"], as_index=False)["duration"]
-        .sum()
-    )
-
-    if time_df.empty:
-        st.info("No time-based workouts in this period")
-    else:
-        time_df["date_only"] = time_df["date"].dt.date
-
-        fig = px.line(
-            time_df.assign(date_only=time_df["date"].dt.date),
-            x="date_only",
-            y="duration",
-            color="exercise",
-            markers=True
-        )
-
-        fig.update_layout(
-            height=320,
-            paper_bgcolor="#000",
-            plot_bgcolor="#000",
-            font=dict(color="#fff"),
-            yaxis_title="Minutes",
-            xaxis_title="Date",
-            xaxis_tickformat="%d %b"
-
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-    # =========================
-    # PER-WORKOUT MISSED DAYS
-    # =========================
-    st.divider()
-    st.subheader("❌ Missed Days by Workout")
-
-    # All days in selected range
-    all_days = pd.date_range(start=start, end=end, freq="D")
-    total_days = len(all_days)
-
-    # Fixed workout list (important)
-    all_exercises = [
-        "Push-ups",
-        "Squats",
-        "Bicep Curls",
-        "Tricep Pushbacks",
-        "Handgrip",
-        "Walking",
-        "Step Climbing",
-        "Plank"
-    ]
-
-    missed_data = []
-
-    for exercise in all_exercises:
-        done_days = (
-            df[df["exercise"] == exercise]["date"]
-            .dt.normalize()
-            .nunique()
-        )
-
-        missed_days = total_days - done_days
-
-        missed_data.append({
-            "Workout": exercise,
-            "Missed Days": missed_days
-        })
-
-    missed_df = pd.DataFrame(missed_data)
-
-    # Optional: sort by most missed
-    missed_df = missed_df.sort_values(
-        by="Missed Days",
-        ascending=False
-    )
-
-    # Display as simple table
-    st.dataframe(
-        missed_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.divider()
-    st.subheader("📈 Progressive Reps")
-
-    exercise = st.selectbox(
-        "Select Exercise",
-        reps_exercises,
-        key="progress_exercise"
-    )
-
-    ex_df = df[df["exercise"] == exercise].copy()
-
-    if ex_df.empty:
-        st.info("No data for selected exercise")
-        return
-    
-    if period == "Weekly":
-        st.markdown("### 🔁 Weekly Progressive Reps")
-
-        # This week (Mon–Sun)
-        this_week_start = today - pd.Timedelta(days=today.weekday())
-        this_week_end = this_week_start + pd.Timedelta(days=6)
-
-        # Last week (Mon–Sun)
-        last_week_start = this_week_start - pd.Timedelta(days=7)
-        last_week_end = this_week_start - pd.Timedelta(days=1)
-
-        this_week_reps = ex_df[
-            ex_df["date"].between(this_week_start, this_week_end)
-        ]["total_reps"].sum()
-
-        last_week_reps = ex_df[
-            ex_df["date"].between(last_week_start, last_week_end)
-        ]["total_reps"].sum()
-
-        if last_week_reps == 0:
-            st.info("Not enough data to compare with last week")
-        else:
-            progress = ((this_week_reps - last_week_reps) / last_week_reps) * 100
-
-            st.metric(
-                "Weekly Progress",
-                f"{this_week_reps} reps",
-                f"{progress:+.2f}%"
-            )
-    elif period == "Monthly":
-        st.markdown("### 📅 Monthly Progressive Reps")
-
-        # This month
-        this_month_start = today.replace(day=1)
-
-        # Last month
-        last_month_end = this_month_start - pd.Timedelta(days=1)
-        last_month_start = last_month_end.replace(day=1)
-
-        this_month_reps = ex_df[
-            ex_df["date"].between(this_month_start, today)
-        ]["total_reps"].sum()
-
-        last_month_reps = ex_df[
-            ex_df["date"].between(last_month_start, last_month_end)
-        ]["total_reps"].sum()
-
-        if last_month_reps == 0:
-            st.info("Not enough data to compare with last month")
-        else:
-            progress = ((this_month_reps - last_month_reps) / last_month_reps) * 100
-
-            st.metric(
-                "Monthly Progress",
-                f"{this_month_reps} reps",
-                f"{progress:+.2f}%"
+            # ---------- LAND ----------
+            land_df = pd.read_sql(
+                "SELECT location, SUM(area_size) AS sqft FROM land_assets GROUP BY location",
+                engine
             )
 
+            land_values = {}
+            land_total = 0.0
 
+            for _, r in land_df.iterrows():
+                key = f"land:{r['location']}"
+                price = get_price(db, key, 0.0)
+                val = r["sqft"] * price
+                land_values[r["location"]] = val
+                land_total += val
 
-    # ==================
-    # FOOD (PLACEHOLDER)
-    # ==================
-    st.divider()
-    st.subheader("🍽 Food")
+            # ---------- FIXED DEPOSITS ----------
+            today = date.today()
+            fd_total = 0.0
 
-    st.info("Food tracking summary will appear here")
-
-
-# ===============
-# WORKOUT SECTION
-# ===============
-def habit_workout():
-    st.title("🏋️ Workout Tracker")
-
-    exercises = [
-        "Push-ups",
-        "Squats",
-        "Bicep Curls",
-        "Tricep Pushbacks",
-        "Handgrip",
-        "Walking",
-        "Step Climbing",
-        "Plank"
-    ]
-
-    with SessionLocal() as db:
-        # ============
-        # ADD WORKOUT
-        # ============
-        st.subheader("➕ Add Workout")
-
-        workout_date = st.date_input("Workout Date", value=date.today())
-        exercise = st.selectbox("Exercise", exercises)
-
-        is_time_based = exercise in ["Walking", "Step Climbing", "Plank"]
-
-        col1, col2 = st.columns(2)
-
-        if is_time_based:
-            with col1:
-                duration = st.number_input(
-                    "Duration (minutes)",
-                    min_value=0.0,
-                    step=1.0
-                )
-            sets = reps = None
-        else:
-            with col1:
-                sets = st.number_input("Sets", min_value=1, step=1)
-            with col2:
-                reps = st.number_input("Reps per set", min_value=1, step=1)
-            duration = None
-
-        if st.button("💾 Save Workout"):
-            db.add(
-                Workout(
-                    date=workout_date,
-                    exercise=exercise,
-                    sets=sets,
-                    reps=reps,
-                    duration_min=duration
-                )
-            )
+            fds = db.query(FixedDeposit).all()
+            for fd in fds:
+                if fd.status == "active":
+                    if today >= fd.maturity_date:
+                        fd.status = "matured"
+                    else:
+                        fd_total += fd_current_value(
+                            fd.principal, fd.rate, fd.deposit_date
+                        )
             db.commit()
-            st.success("Workout saved ✅")
-            st.rerun()
 
-        # ========
-        # FILTERS
-        # ========
-        st.divider()
-        st.subheader("🔍 Filters")
+            # =====================================================
+            # PRICE INPUTS (PERSISTENT)
+            # =====================================================
+            st.subheader("💰 Valuation Inputs")
 
+            c1, c2 = st.columns(2)
+            with c1:
+                gold_price = st.number_input("Gold ₹ / gram", value=gold_price, step=10.0)
+                set_price(db, "gold_price", gold_price)
+
+            with c2:
+                silver_price = st.number_input("Silver ₹ / gram", value=silver_price, step=1.0)
+                set_price(db, "silver_price", silver_price)
+
+            st.markdown("### 🏞️ Land Prices (₹ / sqft)")
+            for loc in land_values:
+                key = f"land:{loc}"
+                p = st.number_input(
+                    loc,
+                    value=get_price(db, key, 0.0),
+                    step=100.0,
+                    key=f"dash_{key}"
+                )
+                set_price(db, key, p)
+
+        # =====================================================
+        # DASHBOARD (PIES)
+        # =====================================================
+        st.subheader("📊 Asset Dashboard")
         col1, col2 = st.columns(2)
 
         with col1:
-            date_filter = st.radio(
-                "Date Filter",
-                ["Last 7 Days", "Monthly", "Yearly", "Custom"],
+            df_main = pd.DataFrame({
+                "Category": ["Metals", "Land", "FDs"],
+                "Value": [metal_total, land_total, fd_total]
+            })
+            fig1 = px.pie(df_main, names="Category", values="Value", hole=0.4)
+            fig1.update_layout(paper_bgcolor="#000", font=dict(color="white"))
+            fig1.update_traces(marker=dict(line=dict(color="black", width=2)))
+            st.plotly_chart(fig1, use_container_width=True)
+
+        with col2:
+            labels = ["Gold", "Silver"] + list(land_values.keys()) + ["FDs"]
+            values = [gold_value, silver_value] + list(land_values.values()) + [fd_total]
+            df_sub = pd.DataFrame({"Asset": labels, "Value": values})
+            fig2 = px.pie(df_sub, names="Asset", values="Value", hole=0.4)
+            fig2.update_layout(paper_bgcolor="#000", font=dict(color="white"))
+            fig2.update_traces(marker=dict(line=dict(color="black", width=2)))
+            st.plotly_chart(fig2, use_container_width=True)
+
+        # =====================================================
+        # VALUATION SUMMARY (NUMBERS BELOW PIE CHARTS)
+        # =====================================================
+        st.markdown("### 📌 Asset Valuation Summary")
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.metric(
+                "🪙 Metals Total",
+                f"₹ {metal_total:,.2f}",
+                help=f"Gold: ₹ {gold_value:,.2f} | Silver: ₹ {silver_value:,.2f}"
+            )
+
+        with c2:
+            st.metric(
+                "🏞️ Land Total",
+                f"₹ {land_total:,.2f}",
+                help="Based on sqft × price per location"
+            )
+
+        with c3:
+            st.metric(
+                "🏦 Fixed Deposits",
+                f"₹ {fd_total:,.2f}",
+                help="Current value of active FDs"
+            )
+
+        grand_total_assets = metal_total + land_total + fd_total
+
+        st.divider()
+
+        st.metric(
+            "💼 TOTAL ASSETS VALUE",
+            f"₹ {grand_total_assets:,.2f}"
+        )
+
+        st.caption(
+            'Valuations are indicative and based on user-entered prices and accrued interest as of today, so dont forget to input the current day\'s prices accordingly in the'
+            '<a href="#asset-inputs">Asset Valuation Inputs</a> section.',
+            unsafe_allow_html=True
+        )
+
+        st.divider()
+
+        # =====================================================
+        # METAL ASSETS – FULL CRUD
+        # =====================================================
+        with st.expander("🪙 Metal Assets", expanded=False):
+
+            col1, col2 = st.columns(2)
+            metal_type = col1.selectbox("Metal", ["Gold", "Silver"])
+            weight = col2.number_input("Weight (g)", min_value=0.0, step=0.1)
+            entry_date = st.date_input("Date", value=date.today())
+
+            if st.button("➕ Add Metal"):
+                if weight > 0:
+                    db.add(MetalAsset(
+                        metal_type=metal_type,
+                        weight_grams=weight,
+                        entry_date=entry_date
+                    ))
+                    db.commit()
+                    st.rerun()
+
+            df = pd.DataFrame(
+                db.query(
+                    MetalAsset.id,
+                    MetalAsset.metal_type,
+                    MetalAsset.weight_grams,
+                    MetalAsset.entry_date
+                ).all(),
+                columns=["id", "Metal", "Weight (g)", "Date"]
+            )
+
+            if not df.empty:
+                edited = st.data_editor(df, disabled=["id"])
+                if st.button("💾 Save Metal Changes"):
+                    for _, r in edited.iterrows():
+                        a = db.get(MetalAsset, int(r["id"]))
+                        if a:
+                            a.metal_type = r["Metal"]
+                            a.weight_grams = r["Weight (g)"]
+                            a.entry_date = pd.to_datetime(r["Date"]).date()
+                    db.commit()
+                    st.rerun()
+
+                del_ids = st.multiselect(
+                    "Delete Metal Entries",
+                    df["id"].tolist(),
+                    format_func=lambda x: f"Metal ID {x}"
+                )
+
+                if del_ids and st.button("❌ Delete Selected Metals"):
+                    for i in del_ids:
+                        a = db.get(MetalAsset, int(i))
+                        if a:
+                            db.delete(a)
+                    db.commit()
+                    st.rerun()
+
+        # ========================
+        # LAND ASSETS – FULL CRUD
+        # ========================
+        with st.expander("🏞️ Land Assets", expanded=False):
+
+            col1, col2 = st.columns(2)
+            area = col1.text_input("Area / Locality")
+            city = col2.text_input("City")
+            sqft = st.number_input("Sqft", min_value=0.0, step=10.0)
+
+            if st.button("➕ Add Land"):
+                if area and city and sqft > 0:
+                    db.add(LandAsset(
+                        location=f"{area}, {city}",
+                        area_unit="sqft",
+                        area_size=sqft
+                    ))
+                    db.commit()
+                    st.rerun()
+
+            land_tbl = pd.DataFrame(
+                db.query(
+                    LandAsset.id,
+                    LandAsset.location,
+                    LandAsset.area_size
+                ).all(),
+                columns=["id", "Place", "Sqft"]
+            )
+
+            if not land_tbl.empty:
+                edited = st.data_editor(land_tbl, disabled=["id"])
+                if st.button("💾 Save Land Changes"):
+                    for _, r in edited.iterrows():
+                        l = db.get(LandAsset, int(r["id"]))
+                        if l:
+                            l.location = r["Place"]
+                            l.area_size = r["Sqft"]
+                    db.commit()
+                    st.rerun()
+
+                del_ids = st.multiselect(
+                    "Delete Land Entries",
+                    land_tbl["id"].tolist(),
+                    format_func=lambda x: f"{x} – {land_tbl.loc[land_tbl.id==x,'Place'].values[0]}"
+                )
+
+                if del_ids and st.button("❌ Delete Selected Land"):
+                    for i in del_ids:
+                        l = db.get(LandAsset, int(i))
+                        if l:
+                            db.delete(l)
+                    db.commit()
+                    st.rerun()
+
+
+        with st.expander("🏦 Fixed Deposits", expanded=False):
+
+            # ======
+            # ADD FD
+            # ======
+            st.subheader("➕ Add Fixed Deposit")
+
+            fd_name = st.text_input("FD Name")
+            principal = st.number_input("Principal (₹)", min_value=0.0, step=1000.0)
+            rate = st.number_input("Interest Rate (%)", min_value=0.0, step=0.1)
+            tenure_type = st.radio(
+                "Tenure Type",
+                ["Years", "Months", "Days"],
                 horizontal=True
             )
 
-        with col2:
-            exercise_filter = st.selectbox(
-                "Exercise Type",
-                ["All"] + exercises
+            tenure_value = st.number_input(
+                f"Tenure ({tenure_type})",
+                min_value=1,
+                step=1
             )
 
-        today = date.today()
+            # Convert everything to days
+            if tenure_type == "Years":
+                tenure_days = tenure_value * 365
+            elif tenure_type == "Months":
+                tenure_days = tenure_value * 30
+            else:
+                tenure_days = tenure_value
 
-        if date_filter == "Last 7 Days":
-            start = today - timedelta(days=6)
-            end = today
+            deposit_date = st.date_input("Deposit Date")
 
-        elif date_filter == "Monthly":
-            months = (
-                db.query(func.strftime("%Y-%m", Workout.date))
-                .distinct()
-                .order_by(func.strftime("%Y-%m", Workout.date))
-                .all()
-            )
+            maturity_date = deposit_date + timedelta(days=tenure_days)
+            tenure_months = max(1, round(tenure_days / 30))
+            maturity_amt = fd_maturity_value(principal, rate, tenure_months)
 
-            if not months:
-                st.info("No workout data available for monthly filter")
-                return
+            c1, c2 = st.columns(2)
+            c1.metric("Maturity Amount (₹)", f"{maturity_amt:,.2f}")
+            c2.metric("Maturity Date", maturity_date.strftime("%d-%m-%Y"))
 
-            labels = [
-                pd.to_datetime(m[0] + "-01").strftime("%b %Y")
-                for m in months
-            ]
+            if st.button("💾 Save FD"):
+                if fd_name and principal > 0 and rate > 0:
+                    db.add(FixedDeposit(
+                        name=fd_name,
+                        principal=principal,
+                        rate=rate,
+                        tenure_months=tenure_months,
+                        deposit_date=deposit_date,
+                        maturity_date=maturity_date,
+                        status="active"
+                    ))
+                    db.commit()
+                    flash("FD added successfully")
+                    st.rerun()
+                else:
+                    st.error("Please fill all FD fields correctly")
 
-            sel = st.selectbox("Select Month", labels)
-            idx = labels.index(sel)
+            st.divider()
 
-            start = pd.to_datetime(months[idx][0] + "-01").date()
-            end = (pd.to_datetime(start) + pd.offsets.MonthEnd(1)).date()
+            # ===============================
+            # ACTIVE FDs (EDIT / DELETE)
+            # ===============================
+            st.subheader("📋 Active Fixed Deposits")
 
-        elif date_filter == "Yearly":
-            years = sorted({
-                int(y[0]) for y in
-                db.query(func.strftime("%Y", Workout.date)).all()
-            })
+            active_fds = db.query(FixedDeposit)\
+                .filter(FixedDeposit.status == "active").all()
 
-            if not years:
-                st.info("No workout data available for yearly filter")
-                return
+            if active_fds:
+                active_df = pd.DataFrame([{
+                    "id": fd.id,
+                    "Name": fd.name,
+                    "Principal": fd.principal,
+                    "Rate (%)": fd.rate,
+                    "Tenure (Months)": fd.tenure_months,
+                    "Deposit Date": fd.deposit_date,
+                    "Maturity Date": fd.maturity_date,
+                    "Current Value (₹)": fd_current_value(
+                        fd.principal, fd.rate, fd.deposit_date
+                    )
+                } for fd in active_fds])
 
-            year = st.selectbox("Select Year", years)
+                edited_df = st.data_editor(
+                    active_df,
+                    disabled=["id", "Current Value (₹)", "Maturity Date"],
+                    use_container_width=True,
+                    column_config={
+                        "Name": st.column_config.TextColumn("FD Name"),
+                        "Principal": st.column_config.NumberColumn("Principal (₹)", min_value=0),
+                        "Rate (%)": st.column_config.NumberColumn("Rate (%)", min_value=0),
+                        "Deposit Date": st.column_config.DateColumn("Deposit Date"),
+                        "Tenure (Months)": st.column_config.NumberColumn(
+                            "Tenure (Months)", min_value=1
+                        )
+                    }
+                )
 
-            start = date(year, 1, 1)
-            end = date(year, 12, 31)
 
-        else:
-            start, end = st.date_input(
-                "Custom Date Range",
-                [today.replace(day=1), today]
-            )
+                if st.button("💾 Save Active FD Changes"):
+                    for _, row in edited_df.iterrows():
+                        fd = db.get(FixedDeposit, int(row["id"]))
+                        if fd:
+                            fd.name = row["Name"]
+                            fd.principal = float(row["Principal"])
+                            fd.rate = float(row["Rate (%)"])
+                            fd.deposit_date = pd.to_datetime(row["Deposit Date"]).date()
+                            fd.tenure_months = int(row["Tenure (Months)"])
+                            fd.maturity_date = fd.deposit_date + relativedelta(
+                                months=fd.tenure_months
+                            )
+                    db.commit()
+                    flash("Active FDs updated successfully")
+                    st.rerun()
 
-        # ===================
-        # LOAD FILTERED DATA
-        # ===================
-        q = (
-            db.query(
-                Workout.id,
-                Workout.date,
-                Workout.exercise,
-                Workout.sets,
-                Workout.reps,
-                Workout.duration_min
-            )
-            .filter(Workout.date.between(start, end))
-        )
 
-        if exercise_filter != "All":
-            q = q.filter(Workout.exercise == exercise_filter)
+                delete_ids = st.multiselect(
+                    "Delete Active FDs",
+                    active_df["id"].tolist(),
+                    format_func=lambda x:
+                        active_df.loc[active_df.id == x, "Name"].values[0]
+                )
 
-        df = pd.DataFrame(
-            q.order_by(Workout.date.desc()).all(),
-            columns=["id", "date", "exercise", "sets", "reps", "duration_min"]
-        )
+                if delete_ids and st.button("❌ Delete Selected Active FDs"):
+                    for i in delete_ids:
+                        fd = db.get(FixedDeposit, int(i))
+                        if fd:
+                            db.delete(fd)
+                    db.commit()
+                    flash("Selected active FDs deleted")
+                    st.rerun()
+            else:
+                st.info("No active fixed deposits")
 
-        if df.empty:
-            st.info("No workouts found for selected filters")
-            return
+            st.divider()
 
-        df["date"] = pd.to_datetime(df["date"])
+            # ===============================
+            # MATURED FDs (DELETE / RENEW)
+            # ===============================
+            st.subheader("✅ Matured Fixed Deposits")
 
-        # ===========
-        # ACTION MODE
-        # ===========
+            matured_fds = db.query(FixedDeposit)\
+                .filter(FixedDeposit.status == "matured").all()
+
+            if matured_fds:
+                matured_df = pd.DataFrame([{
+                    "id": fd.id,
+                    "Name": fd.name,
+                    "Principal": fd.principal,
+                    "Rate (%)": fd.rate,
+                    "Tenure (Months)": fd.tenure_months,
+                    "Deposit Date": fd.deposit_date,
+                    "Maturity Date": fd.maturity_date,
+                    "Maturity Amount (₹)": fd_maturity_value(
+                        fd.principal, fd.rate, fd.tenure_months
+                    )
+                } for fd in matured_fds])
+
+                st.dataframe(matured_df, use_container_width=True)
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    del_ids = st.multiselect(
+                        "Delete Matured FDs",
+                        matured_df["id"].tolist(),
+                        format_func=lambda x:
+                            matured_df.loc[matured_df.id == x, "Name"].values[0]
+                    )
+
+                    if del_ids and st.button("❌ Delete Selected Matured FDs"):
+                        for i in del_ids:
+                            fd = db.get(FixedDeposit, int(i))
+                            if fd:
+                                db.delete(fd)
+                        db.commit()
+                        flash("Matured FDs deleted")
+                        st.rerun()
+
+                with col2:
+                    renew_id = st.selectbox(
+                        "Renew FD",
+                        options=[fd.id for fd in matured_fds],
+                        format_func=lambda x:
+                            matured_df.loc[matured_df.id == x, "Name"].values[0]
+                    )
+
+                    if st.button("🔁 Renew Selected FD"):
+                        old = db.get(FixedDeposit, int(renew_id))
+                        if old:
+                            new_dep = date.today()
+                            new_mat = new_dep + relativedelta(
+                                months=old.tenure_months
+                            )
+
+                            db.add(FixedDeposit(
+                                name=f"{old.name} (Renewed)",
+                                principal=old.principal,
+                                rate=old.rate,
+                                tenure_months=old.tenure_months,
+                                deposit_date=new_dep,
+                                maturity_date=new_mat,
+                                status="active"
+                            ))
+                            db.commit()
+                            flash("FD renewed successfully")
+                            st.rerun()
+            else:
+                st.info("No matured fixed deposits")
+
+
+        # =====================================================
+        # PDF EXPORT (ASSETS WITH TOTALS)
+        # =====================================================
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
         st.divider()
-        action = st.radio(
-            "Action",
-            ["Edit Entries", "Delete Entries"],
+        with st.expander("⬇️ Export to PDF", expanded=False):
+
+            export_sections = st.multiselect(
+                "Select sections to include",
+                ["Metals", "Land", "Fixed Deposits"],
+                default=["Metals", "Land", "Fixed Deposits"]
+            )
+
+            if st.button("🧾 Generate PDF Report"):
+                from reportlab.lib.pagesizes import A4
+                from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+                from reportlab.lib.styles import getSampleStyleSheet
+                from reportlab.lib import colors
+                from io import BytesIO
+                import datetime
+
+                buffer = BytesIO()
+                doc = SimpleDocTemplate(
+                    buffer,
+                    pagesize=A4,
+                    leftMargin=30,
+                    rightMargin=20,
+                    topMargin=30,
+                    bottomMargin=30
+                )
+                styles = getSampleStyleSheet()
+                from reportlab.lib.styles import ParagraphStyle
+
+                styles.add(ParagraphStyle(
+                    name="BlackNormal",
+                    fontName="DejaVu",
+                    fontSize=10,
+                    textColor=colors.white
+                ))
+
+                styles.add(ParagraphStyle(
+                    name="BlackTitle",
+                    fontName="DejaVu",
+                    fontSize=20,
+                    textColor=colors.white,
+                    spaceAfter=14
+                ))
+
+                styles.add(ParagraphStyle(
+                    name="BlackHeading",
+                    fontName="DejaVu",
+                    fontSize=14,
+                    textColor=colors.white,
+                    spaceAfter=10
+                ))
+
+                story = []
+                story.append(Paragraph("Assets Valuation Report", styles["BlackTitle"]))
+                story.append(Paragraph(
+                    f"Generated on: {datetime.date.today()}",
+                    styles["BlackNormal"]
+                ))
+                story.append(Spacer(1, 14))
+
+
+                GRAND_TOTAL = 0.0
+                story.append(Spacer(1, 12))
+
+                # =====================================================
+                # METALS
+                # =====================================================
+                if "Metals" in export_sections:
+                    gold_price = get_price(db, "gold_price")
+                    silver_price = get_price(db, "silver_price")
+
+                # =====================================================
+                # METALS (GOLD & SILVER SIDE BY SIDE)
+                # =====================================================
+                gold_price = get_price(db, "gold_price")
+                silver_price = get_price(db, "silver_price")
+
+                metals_df = pd.read_sql("""
+                    SELECT metal_type, weight_grams
+                    FROM metal_assets
+                """, engine)
+
+                # ---- Split
+                gold_df = metals_df[metals_df["metal_type"] == "Gold"].copy()
+                silver_df = metals_df[metals_df["metal_type"] == "Silver"].copy()
+
+                # ---- Values
+                gold_df["Value (₹)"] = (gold_df["weight_grams"] * gold_price).round(2)
+                silver_df["Value (₹)"] = (silver_df["weight_grams"] * silver_price).round(2)
+
+                gold_total = gold_df["Value (₹)"].sum()
+                silver_total = silver_df["Value (₹)"].sum()
+
+                GRAND_TOTAL += (gold_total + silver_total)
+
+                # ---- Heading
+                story.append(Paragraph("<b>Metal Assets</b>", styles["BlackHeading"]))
+                story.append(Paragraph(
+                    f"Gold ₹/g: {gold_price} | Silver ₹/g: {silver_price}",
+                    styles["BlackNormal"]
+                ))
+                story.append(Spacer(1, 8))
+
+                # ---- GOLD TABLE
+                gold_table_data = [["Gold (grams)", "Value (₹)"]]
+                gold_table_data += gold_df[["weight_grams", "Value (₹)"]].values.tolist()
+                gold_table_data.append(["TOTAL", f"{gold_total:,.2f}"])
+
+                gold_table = Table(gold_table_data, colWidths=[80, 90])
+                gold_table.setStyle(TableStyle([
+                    ("FONT", (0,0), (-1,-1), "DejaVu"),
+                    ("BACKGROUND", (0,0), (-1,0), colors.black),
+                    ("BACKGROUND", (0,1), (-1,-1), colors.black),
+                    ("TEXTCOLOR", (0,0), (-1,-1), colors.white),
+                    ("GRID", (0,0), (-1,-1), 0.5, colors.white),
+                    ("ALIGN", (0,0), (-1,-1), "CENTER"),
+                ]))
+
+                # ---- SILVER TABLE
+                silver_table_data = [["Silver (grams)", "Value (₹)"]]
+                silver_table_data += silver_df[["weight_grams", "Value (₹)"]].values.tolist()
+                silver_table_data.append(["TOTAL", f"{silver_total:,.2f}"])
+
+                silver_table = Table(silver_table_data, colWidths=[80, 90])
+                silver_table.setStyle(TableStyle([
+                    ("FONT", (0,0), (-1,-1), "DejaVu"),
+                    ("BACKGROUND", (0,0), (-1,0), colors.black),
+                    ("BACKGROUND", (0,1), (-1,-1), colors.black),
+                    ("TEXTCOLOR", (0,0), (-1,-1), colors.white),
+                    ("GRID", (0,0), (-1,-1), 0.5, colors.white),
+                    ("ALIGN", (0,0), (-1,-1), "CENTER"),
+                ]))
+
+                # ---- SIDE BY SIDE WRAPPER
+                wrapper = Table(
+                    [[gold_table, silver_table]],
+                    colWidths=[250, 250]
+                )
+
+                story.append(wrapper)
+                story.append(Spacer(1, 14))
+
+
+                # =====================================================
+                # LAND
+                # =====================================================
+                if "Land" in export_sections:
+                    land_df = pd.read_sql("""
+                        SELECT location, area_size
+                        FROM land_assets
+                    """, engine)
+
+                    land_df["Price ₹/sqft"] = land_df["location"].apply(
+                        lambda loc: get_price(db, f"land:{loc}")
+                    )
+                    land_df["Value (₹)"] = land_df["area_size"] * land_df["Price ₹/sqft"]
+
+                    total_land = land_df["Value (₹)"].sum()
+                    GRAND_TOTAL += total_land
+
+                    story.append(Paragraph("<b>Land Assets</b>", styles["BlackHeading"]))
+                    story.append(Spacer(1, 6))
+
+                    table_data = [list(land_df.columns)] + land_df.values.tolist()
+                    table_data.append(["", "TOTAL", "", f"{total_land:,.2f}"])
+
+                    table = Table(table_data, hAlign="LEFT")
+                    table.setStyle(TableStyle([
+                        ("FONT", (0,0), (-1,-1), "DejaVu"),
+                        ("BACKGROUND", (0,0), (-1,0), colors.black),
+                        ("BACKGROUND", (0,1), (-1,-1), colors.black),
+                        ("TEXTCOLOR", (0,0), (-1,-1), colors.white),
+                        ("GRID", (0,0), (-1,-1), 0.5, colors.white),
+                        ("ALIGN", (0,0), (-1,-1), "LEFT"),
+                        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                        ("LEFTPADDING", (0,0), (-1,-1), 6),
+                        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+                    ]))
+
+
+                    story.append(table)
+                    story.append(Spacer(1, 14))
+
+                # =====================================================
+                # FIXED DEPOSITS
+                # =====================================================
+                if "Fixed Deposits" in export_sections:
+                    try:
+                        fd_df = pd.read_sql("""
+                            SELECT name, principal, rate, tenure_months, deposit_date
+                            FROM fixed_deposits
+                        """, engine)
+
+                        today = datetime.date.today()
+
+                        fd_df["Current Value (₹)"] = fd_df.apply(
+                            lambda r: round(
+                                r["principal"] *
+                                ((1 + r["rate"] / 100) **
+                                ((today - pd.to_datetime(r["deposit_date"]).date()).days / 365)),
+                                2
+                            ),
+                            axis=1
+                        )
+
+                        total_fd = fd_df["Current Value (₹)"].sum()
+                        GRAND_TOTAL += total_fd
+
+                        story.append(Paragraph("<b>Fixed Deposits</b>", styles["BlackHeading"]))
+                        story.append(Spacer(1, 6))
+
+                        table_data = [list(fd_df.columns)] + fd_df.values.tolist()
+                        table_data.append([
+                            "TOTAL",   # Deposit Account
+                            "",        # principal
+                            "",        # rate
+                            "",        # months
+                            "",        # deposit_date
+                            f"{total_fd:,.2f}"  # Current Value
+                        ])
+
+                        table = Table(table_data, hAlign="LEFT")
+                        table.setStyle(TableStyle([
+                            ("FONT", (0,0), (-1,-1), "DejaVu"),
+                            ("BACKGROUND", (0,0), (-1,0), colors.black),
+                            ("BACKGROUND", (0,1), (-1,-1), colors.black),
+                            ("TEXTCOLOR", (0,0), (-1,-1), colors.white),
+                            ("GRID", (0,0), (-1,-1), 0.5, colors.white),
+                            ("ALIGN", (0,0), (-1,-1), "LEFT"),
+                            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                            ("LEFTPADDING", (0,0), (-1,-1), 6),
+                            ("RIGHTPADDING", (0,0), (-1,-1), 6),
+                        ]))
+
+
+                        story.append(table)
+
+                    except Exception:
+                        story.append(Paragraph("Fixed Deposits not available.", styles["BlackNormal"]))
+
+
+
+                # ================= GRAND TOTAL =================
+                story.append(Spacer(1, 24))
+
+                story.append(Paragraph(
+                    f"<b>GRAND TOTAL ASSETS VALUE</b>",
+                    styles["BlackHeading"]
+                ))
+
+                story.append(Spacer(1, 6))
+
+                story.append(Paragraph(
+                    f"₹ {GRAND_TOTAL:,.2f}",
+                    ParagraphStyle(
+                        name="GrandTotalValue",
+                        fontName="DejaVu",
+                        fontSize=18,
+                        textColor=colors.white,
+                        leading=22
+                    )
+                ))
+
+                from reportlab.lib import colors
+
+                def black_page_background(canvas, doc):
+                    canvas.saveState()
+                    canvas.setFillColor(colors.black)
+                    canvas.rect(
+                        0,
+                        0,
+                        doc.pagesize[0],
+                        doc.pagesize[1],
+                        fill=1,
+                        stroke=0
+                    )
+                    canvas.restoreState()
+
+
+                doc.build(
+                    story,
+                    onFirstPage=black_page_background,
+                    onLaterPages=black_page_background
+                )
+
+
+                st.download_button(
+                    "⬇️ Download Assets PDF",
+                    data=buffer.getvalue(),
+                    file_name="assets_report.pdf",
+                    mime="application/pdf"
+                )
+
+
+# ======================
+# APPLIANCES PAGE   
+# ======================
+def appliances_page():
+    st.header("🔌 Appliances")
+
+    show_thumbnails = st.toggle("Show Thumbnails", value=False)
+
+    with st.form("add_appliance"):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            name = st.text_input("Appliance Name")
+
+        with col2:
+            price = st.number_input(
+                "Price",
+                min_value=0.0,
+                step=100.0,
+                format="%.2f"
+            )
+
+        col3, col4 = st.columns(2)
+
+        with col3:
+            purchase_date = st.date_input(
+                "Purchase Date",
+                value=date.today()
+            )
+
+        with col4:
+            warranty_expiry = st.date_input(
+                "Warranty Expiry",
+                value=None
+            )
+
+        images = st.file_uploader(
+            "Upload Appliance & Invoice Images",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True
+        )
+
+        submit = st.form_submit_button("Add Appliance")
+
+
+        if submit and name:
+            db = SessionLocal()
+
+            appliance = Appliance(
+                name=name,
+                price=price,
+                purchase_date=purchase_date,
+                warranty_expiry=warranty_expiry,
+            )
+            db.add(appliance)
+            db.commit()
+            db.refresh(appliance)
+
+            if images:
+                for img in images:
+                    safe = f"{int(time.time())}_{img.name}"
+                    path = os.path.join(APPLIANCE_IMG_DIR, safe)
+                    with open(path, "wb") as f:
+                        f.write(img.getbuffer())
+
+                    db.add(ApplianceImage(
+                        appliance_id=appliance.id,
+                        image_path=path
+                    ))
+
+            db.commit()
+            db.close()
+            flash("Appliance added")
+            st.rerun()
+
+    db = SessionLocal()
+    appliances = (
+        db.query(Appliance)
+        .options(joinedload(Appliance.images))
+        .order_by(Appliance.purchase_date.desc())
+        .all()
+    )
+    db.close()
+
+    st.divider()
+    if not appliances:
+        st.info("No appliances added yet")
+        return
+
+    # ======================
+    # APPLIANCES PIE CHARTS
+    # ======================
+    with st.expander("📊 Appliance Insights", expanded=False):
+
+        chart_type = st.radio(
+            "View",
+            ["By Value", "By Purchase Year"],
             horizontal=True
         )
 
-        # =========
-        # EDIT MODE
-        # =========
-        if action == "Edit Entries":
-            edited_df = st.data_editor(
-                df,
-                use_container_width=True,
-                disabled=["id"],
-                column_config={
-                    "date": st.column_config.DateColumn("Date"),
-                    "exercise": st.column_config.SelectboxColumn(
-                        "Exercise",
-                        options=exercises
-                    ),
-                    "sets": st.column_config.NumberColumn("Sets", min_value=0),
-                    "reps": st.column_config.NumberColumn("Reps", min_value=0),
-                    "duration_min": st.column_config.NumberColumn(
-                        "Duration (min)",
-                        min_value=0.0
-                    ),
-                }
-            )
+        if appliances:
 
-            if st.button("💾 Save Changes"):
-                with db.no_autoflush:
-                    for _, row in edited_df.iterrows():
-                        w = db.get(Workout, int(row["id"]))
-                        if not w:
-                            continue
-                        w.date = pd.to_datetime(row["date"]).date()
-                        w.exercise = row["exercise"]
-                        w.sets = int(row["sets"]) if not pd.isna(row["sets"]) else None
-                        w.reps = int(row["reps"]) if not pd.isna(row["reps"]) else None
-                        w.duration_min = (
-                            float(row["duration_min"])
-                            if not pd.isna(row["duration_min"])
-                            else None
-                        )
-                db.commit()
-                st.success("Workout entries updated ✅")
-                st.rerun()
+            # ---------- BY VALUE ----------
+            if chart_type == "By Value":
+                df_pie = pd.DataFrame([{
+                    "Appliance": a.name,
+                    "Price": float(a.price)
+                } for a in appliances])
 
-        # ============
-        # DELETE MODE
-        # ============
-        else:
-            delete_mode = st.radio(
-                "Delete Option",
-                ["Delete selected rows", "Delete ALL filtered rows"],
-                horizontal=True
-            )
-
-            df_del = df.copy()
-            df_del["date"] = df_del["date"].dt.strftime("%Y-%m-%d")
-
-            if delete_mode == "Delete selected rows":
-                gb = GridOptionsBuilder.from_dataframe(df_del)
-                gb.configure_column("date", checkboxSelection=True, headerCheckboxSelection=True)
-                gb.configure_column("id", hide=True)
-                gb.configure_grid_options(
-                    rowSelection="multiple",
-                    suppressRowClickSelection=True
+                fig = px.pie(
+                    df_pie,
+                    names="Appliance",
+                    values="Price",
+                    hole=0.4
                 )
 
-                grid = AgGrid(
-                    df_del,
-                    gridOptions=gb.build(),
-                    update_mode=GridUpdateMode.MODEL_CHANGED,
-                    fit_columns_on_grid_load=True
-                )
-
-                selected = pd.DataFrame(grid["selected_rows"])
-
-                if not selected.empty:
-                    st.warning(f"Selected rows: {len(selected)}")
-
-                    if st.checkbox("Confirm delete selected workouts"):
-                        if st.button("❌ Delete Selected"):
-                            for _, row in selected.iterrows():
-                                w = db.get(Workout, int(row["id"]))
-                                if w:
-                                    db.delete(w)
-                            db.commit()
-                            st.success("Selected workouts deleted")
-                            st.rerun()
-
+            # ---------- BY YEAR ----------
             else:
-                st.warning(f"This will delete ALL {len(df)} filtered workouts")
-                if st.checkbox("I understand this is permanent"):
-                    if st.button("❌ Delete ALL Filtered"):
-                        for _, row in df.iterrows():
-                            w = db.get(Workout, int(row["id"]))
-                            if w:
-                                db.delete(w)
+                df_pie = pd.DataFrame([{
+                    "Year": a.purchase_date.year
+                } for a in appliances])
+
+                df_pie = df_pie.value_counts().reset_index()
+                df_pie.columns = ["Year", "Count"]
+
+                fig = px.pie(
+                    df_pie,
+                    names="Year",
+                    values="Count",
+                    hole=0.4
+                )
+
+            # ---------- DARK THEME ----------
+            fig.update_layout(
+                paper_bgcolor="black",
+                plot_bgcolor="black",
+                font=dict(color="white"),
+                legend=dict(font=dict(color="white"))
+            )
+
+            fig.update_traces(
+                marker=dict(line=dict(color="black", width=2))
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            st.info("No appliance data available to visualize.")
+
+
+    for a in appliances:
+
+        with st.expander(f"{a.name} | ₹{a.price:,.0f} | {a.purchase_date}"):
+
+            # ======================
+            # VIEW MODE
+            # ======================
+            if not is_edit_mode(a.id):
+
+                c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+
+                c1.write(f"**Appliance**: {a.name}")
+                c2.write(f"**Price**: ₹{a.price:,.2f}")
+                c3.write(f"**Purchased**: {a.purchase_date}")
+                c4.write(f"**Warranty**: {a.warranty_expiry or '—'}")
+
+                # ---- IMAGE VIEW (LOCAL VIEWER)
+                if a.images:
+                    st.divider()
+                    for img in a.images:
+                        col_img1, col_img2 = st.columns([4, 1])
+
+                        col_img1.write(os.path.basename(img.image_path))
+
+                        if col_img2.button(
+                            "📂 Open",
+                            key="openimg_" + str(img.id)
+                        ):
+                            open_image(img.image_path)
+
+                st.divider()
+
+                col_edit, col_delete = st.columns([1, 1])
+
+                if col_edit.button("✏️ Edit", key="edit_" + str(a.id)):
+                    st.session_state[f"edit_mode_{a.id}"] = True
+                    st.rerun()
+
+                if col_delete.button("❌ Delete Appliance", key="del_" + str(a.id)):
+                    st.session_state["confirm_" + str(a.id)] = True
+
+            # ======================
+            # EDIT MODE
+            # ======================
+            else:
+                with st.form("edit_form_" + str(a.id)):
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        edit_name = st.text_input(
+                            "Appliance Name",
+                            value=a.name
+                        )
+                    with col2:
+                        edit_price = st.number_input(
+                            "Price",
+                            min_value=0.0,
+                            step=100.0,
+                            format="%.2f",
+                            value=float(a.price)
+                        )
+
+                    col3, col4 = st.columns(2)
+                    with col3:
+                        edit_purchase_date = st.date_input(
+                            "Purchase Date",
+                            value=a.purchase_date
+                        )
+                    with col4:
+                        edit_warranty = st.date_input(
+                            "Warranty Expiry",
+                            value=a.warranty_expiry
+                        )
+
+                    new_images = st.file_uploader(
+                        "Add More Images",
+                        type=["jpg", "jpeg", "png"],
+                        accept_multiple_files=True
+                    )
+
+                    col_save, col_cancel = st.columns(2)
+
+                    save = col_save.form_submit_button("💾 Save Changes")
+                    cancel = col_cancel.form_submit_button("❌ Cancel")
+
+                    if save:
+                        db = SessionLocal()
+                        appliance = db.get(Appliance, a.id)
+
+                        appliance.name = edit_name
+                        appliance.price = edit_price
+                        appliance.purchase_date = edit_purchase_date
+                        appliance.warranty_expiry = edit_warranty
+
+                        if new_images:
+                            for img in new_images:
+                                safe = f"{int(time.time())}_{img.name}"
+                                path = os.path.join(APPLIANCE_IMG_DIR, safe)
+                                with open(path, "wb") as f:
+                                    f.write(img.getbuffer())
+
+                                db.add(ApplianceImage(
+                                    appliance_id=appliance.id,
+                                    image_path=path
+                                ))
+
                         db.commit()
-                        st.success("All filtered workouts deleted")
+                        db.close()
+
+                        st.session_state[f"edit_mode_{a.id}"] = False
+                        flash("Appliance updated")
                         st.rerun()
 
+                    if cancel:
+                        st.session_state[f"edit_mode_{a.id}"] = False
+                        st.rerun()
 
-def habit_water():
-    st.title("💧 Water")
-    st.info("Water intake tracking coming soon")
+            # ======================
+            # DELETE CONFIRMATION
+            # ======================
+            if st.session_state.get("confirm_" + str(a.id)):
+                st.warning("This will permanently delete this appliance and all its images.")
+                yes, no = st.columns(2)
 
-def habit_food():
-    st.title("🍽 Food")
-    st.info("Food tracking coming soon")
+                if yes.button("Yes, Delete", key="yes_" + str(a.id)):
+                    db = SessionLocal()
+                    appliance = db.get(Appliance, a.id)
 
+                    for img in appliance.images:
+                        if os.path.exists(img.image_path):
+                            os.remove(img.image_path)
 
-def habit_daily_health():
-    st.title("💧😴⚖️ Daily Health")
+                    db.delete(appliance)
+                    db.commit()
+                    db.close()
 
-    with SessionLocal() as db:
-        date_selected = st.date_input("Date", value=date.today())
+                    del st.session_state["confirm_" + str(a.id)]
+                    flash("Appliance deleted")
+                    st.rerun()
 
-        existing = db.get(DailyHealth, date_selected)
+                if no.button("Cancel", key="no_" + str(a.id)):
+                    del st.session_state["confirm_" + str(a.id)]
 
-        col1, col2, col3 = st.columns(3)
+            
+# ======================
+# APPLIANCES PDF EXPORT
+# ======================
+    st.divider()
 
-        with col1:
-            water = st.number_input(
-                "💧 Water (Litres)",
-                min_value=0,
-                max_value=30,
-                step=1,
-                value=existing.water if existing else 0
-            )
+    with st.expander("⬇️ Export Appliances Data as PDF", expanded=False):
 
-        with col2:
-            sleep_hours = st.number_input(
-                "😴 Sleep (hours)",
-                min_value=0.0,
-                max_value=24.0,
-                step=0.5,
-                value=existing.sleep if existing else 0.0
-            )
+                if st.button(
+                        "🧾 Generate Appliances Data PDF",
+                        key="appliances_pdf_export"
+                    ):
 
-        with col3:
-            weight = st.number_input(
-                "⚖️ Weight (kg)",
-                min_value=0.0,
-                max_value=300.0,
-                step=0.1,
-                value=existing.weight if existing else 0.0
-            )
-
-        if st.button("💾 Save Daily Health"):
-            if existing:
-                existing.water = water
-                existing.sleep = sleep_hours
-                existing.weight = weight
-            else:
-                db.add(
-                    DailyHealth(
-                        date=date_selected,
-                        water=water,
-                        sleep=sleep_hours,
-                        weight=weight
+                    from reportlab.platypus import (
+                        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
                     )
-                )
-            db.commit()
-            st.success("Daily health saved ✅")
-            st.rerun()
+                    from reportlab.lib.pagesizes import A4
+                    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+                    from reportlab.lib import colors
+                    from io import BytesIO
+                    import datetime
 
+                    buffer = BytesIO()
 
-def habit_insights():
-    st.title("📈 Habit Insights")
-    st.info("Habit insights coming soon")
+                    doc = SimpleDocTemplate(
+                        buffer,
+                        pagesize=A4,
+                        leftMargin=30,
+                        rightMargin=30,
+                        topMargin=30,
+                        bottomMargin=30
+                    )
 
-def habit_export():
-    st.title("📤 Habit Export")
-    st.info("Habit export coming soon")
-# ================= SIDEBAR =================
-tracker = st.sidebar.radio(
-    "📌 Select Tracker",
-    ["Finance", "Habit"]
-)
-if tracker == "Finance":
-    page = st.sidebar.radio(
-        "Finance Menu",
-        [
-            "Expense Dashboard",
-            "Add Expense",
-            "Income & Dashboard",
-            "Insights",
-            "Export Data",
-        ]
+                    styles = getSampleStyleSheet()
+
+                    styles.add(ParagraphStyle(
+                        name="WhiteTitle",
+                        fontName="DejaVu",
+                        fontSize=20,
+                        textColor=colors.white,
+                        spaceAfter=14
+                    ))
+
+                    styles.add(ParagraphStyle(
+                        name="WhiteNormal",
+                        fontName="DejaVu",
+                        fontSize=10,
+                        textColor=colors.white,
+                        spaceAfter=6
+                    ))
+
+                    styles.add(ParagraphStyle(
+                        name="WhiteHeading",
+                        fontName="DejaVu",
+                        fontSize=14,
+                        textColor=colors.white,
+                        spaceAfter=10
+                    ))
+
+                    story = []
+
+                    # -------- TITLE --------
+                    story.append(Paragraph("Appliances Report", styles["WhiteTitle"]))
+                    story.append(Paragraph(
+                        f"Generated on: {datetime.date.today()}",
+                        styles["WhiteNormal"]
+                    ))
+                    story.append(Spacer(1, 12))
+
+                    # -------- FETCH DATA --------
+                    db = SessionLocal()
+                    appliances = (
+                        db.query(Appliance)
+                        .options(joinedload(Appliance.images))
+                        .order_by(Appliance.purchase_date.desc())
+                        .all()
+                    )
+                    db.close()
+
+                    if not appliances:
+                        story.append(Paragraph(
+                            "No appliance data available.",
+                            styles["WhiteNormal"]
+                        ))
+                    else:
+                        table_data = [
+                                ["Name", "Price (₹)", "Purchase Date", "Warranty Expiry"]
+                        ]
+
+                        for ap in appliances:
+                            table_data.append([
+                                ap.name,
+                                f"{ap.price:,.2f}",
+                                ap.purchase_date.strftime("%Y-%m-%d"),
+                                ap.warranty_expiry.strftime("%Y-%m-%d") if ap.warranty_expiry else "—"
+                            ])
+
+                        table = Table(
+                            table_data,
+                            colWidths=[160, 90, 100, 100],
+                            hAlign="LEFT"
+                        )
+
+                        table.setStyle(TableStyle([
+                            ("FONT", (0, 0), (-1, -1), "DejaVu"),
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.black),
+                            ("BACKGROUND", (0, 1), (-1, -1), colors.black),
+                            ("TEXTCOLOR", (0, 0), (-1, -1), colors.white),
+                            ("GRID", (0, 0), (-1, -1), 0.5, colors.white),
+                            ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("TOPPADDING", (0, 0), (-1, -1), 6),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                        ]))
+
+                        story.append(table)
+
+                    # -------- BLACK PAGE BACKGROUND --------
+                    def black_page(canvas, doc):
+                        canvas.saveState()
+                        canvas.setFillColor(colors.black)
+                        canvas.rect(
+                            0, 0,
+                            doc.pagesize[0],
+                            doc.pagesize[1],
+                            fill=1,
+                            stroke=0
+                        )
+                        canvas.restoreState()
+
+                    doc.build(
+                        story,
+                        onFirstPage=black_page,
+                        onLaterPages=black_page
+                    )
+
+                    st.download_button(
+                        "⬇️ Download Appliances PDF",
+                        data=buffer.getvalue(),
+                        file_name="appliances_report.pdf",
+                        mime="application/pdf"
+                    )
+            
+st.markdown('<div id="breadcrumbs"></div>', unsafe_allow_html=True)
+
+# ======================
+# SIDEBAR NAVIGATION
+# ======================
+st.sidebar.title("💰 Finance Tracker")
+page = st.sidebar.radio(
+    "Navigate",
+    [
+    "📊 Expense Dashboard",
+    "➕ Add Expense",
+    "📤 Export Expenses",
+    "🔌 Appliances Data",
+    "💰 Income",
+    "🏦 Assets",
+    "📈 Insights"
+    ],
+    index =0
+)       
+# ======================
+# PAGE ROUTING
+# ======================
+if "page_loaded" not in st.session_state:
+    st.session_state.page_loaded = False
+# If the page is loaded for the first time, set the flag
+st.session_state.page_loaded = True
+PAGE_ORDER = {
+    "Dashboard": 0,
+    "Expenses": 1,
+    "Income": 2,
+    "Assets": 3,
+    "Reports": 4
+}
+current_page = page                                                # whatever variable you use
+prev_page = st.session_state.get("prev_page", current_page)        # get previous page from session state
+direction = "right"                                                # default direction
+if PAGE_ORDER.get(current_page, 0) < PAGE_ORDER.get(prev_page, 0): # if current_page != prev_page:
+    direction = "left"                                             # determine direction
+st.session_state.prev_page = current_page                          # update previous page
+st.markdown(                                                       # inject direction attribute 
+    f"""
+    <script>
+    document.documentElement.setAttribute(
+        "data-nav-direction",
+        "{direction}"
+    );
+    </script>
+    """,    
+    unsafe_allow_html=True
+)                                                                 
+# ======================
+# BREADCRUMBS RENDERING
+# ======================
+def render_breadcrumbs(page):                             
+    st.markdown(
+        f"""
+        <div class="breadcrumb">
+            Home <span>›</span> {page}
+        </div>
+        """,
+        unsafe_allow_html=True
     )
-else:  
-    page = st.sidebar.radio(
-        "Habit Menu",
-        [
-            "Dashboard",
-            "Workout",
-            "Daily Health",
-            "Food",
-            "Insights",
-            "Export Data",
-        ]
-    )
-
-
-
-# ================= ROUTER =================
-if tracker == "Finance":
-    if page == "Expense Dashboard":
-        dashboard()
-    elif page == "Add Expense":
-        add_expense() 
-    elif page == "Income & Dashboard":
-        income_section()
-    elif page == "Insights":
-        insights()
-    elif page == "Export Data":
-        export_data()
-else:
-    if page == "Dashboard":
-        habit_dashboard()
-    elif page == "Workout":
-        habit_workout()
-    elif page == "Daily Health":
-        habit_daily_health()
-    elif page == "Food":
-        habit_food()
-    elif page == "Insights":
-        habit_insights()
-    elif page == "Export Data":
-        habit_export()
+render_breadcrumbs(current_page)
+# =============
+# PAGE ROUTING
+# =============
+if page == "📊 Expense Dashboard":
+    dashboard()
+elif page == "➕ Add Expense":
+    add_expense()
+elif page == "💰 Income":
+    income_section()
+elif page == "🏦 Assets":
+    assets_page()
+elif page == "📈 Insights":
+    insights()
+elif page == "🔌 Appliances Data":
+    appliances_page()
+elif page == "📤 Export Expenses":
+    export_data()
