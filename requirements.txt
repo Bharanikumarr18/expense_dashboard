@@ -6,3 +6,5 @@ plotly
 reportlab
 python-dateutil
 streamlit-aggrid
+setuptools
+
