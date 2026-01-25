@@ -1,19 +1,26 @@
-# Virtual env
-venv/
-
-# Python cache
+# Python
 __pycache__/
 *.pyc
 
-# Database
-expense.db
+# Virtual env
+venv/
+
+# Databases
+*.db
+*.sqlite
+
+# User data
+uploaded_photos/
+appliance_images/
+
+# Browser / OS junk
+chrome-profile/
 
 # Build artifacts
 build/
 dist/
-*.spec
 
-# OS / editor
-.streamlit/
-.vscode/
-wget-log*
+# OS files
+.DS_Store
+expense.db
+
