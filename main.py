@@ -1,4 +1,3 @@
-from pkg_resources import safe_name
 import streamlit as st
 import pandas as pd
 import datetime
@@ -47,6 +46,10 @@ if "open_asset_inputs" not in st.session_state:
 # =======================
 if "show_weekly_trend" not in st.session_state:
     st.session_state.show_weekly_trend = True
+
+if "show_inv_delete_manager" not in st.session_state:
+    st.session_state.show_inv_delete_manager = False
+
 # ==============
 # FLASH MESSAGE
 # ==============
@@ -72,6 +75,7 @@ DATABASE_URL = st.secrets.get(
     "DATABASE_URL",
     "sqlite:///expense.db"  # fallback for local use
 )
+DB_URL = "sqlite:///expense.db"
 
 engine = create_engine(
     DATABASE_URL,
@@ -191,12 +195,12 @@ class Appliance(Base):                                   # appliance assets
     warranty_expiry = Column(Date, nullable=True)        # warranty expiry date
     depreciation_years = Column(Integer, nullable=True)  # useful life in years
 # ----APPLIANCE IMAGES----
-class ApplianceImage(Base):                                  # images for appliances   
-    __tablename__ = "appliance_images"                       # unique image id
-    id = Column(Integer, primary_key=True)                   # optional
-    appliance_id = Column(Integer, ForeignKey("appliances.id", ondelete="CASCADE")) # appliance foreign key
-    image_path = Column(String, nullable=False)              # path to image file
-    appliance = relationship("Appliance", backref="images")  # relationship to Appliance
+class ApplianceImage(Base):                                   
+    __tablename__ = "appliance_images"                      
+    id = Column(Integer, primary_key=True)                  
+    appliance_id = Column(Integer, ForeignKey("appliances.id", ondelete="CASCADE")) 
+    image_path = Column(String, nullable=False)              
+    appliance = relationship("Appliance", backref="images")  
 # ======================
 # LIC POLICIES (SIMPLE)
 # ======================
@@ -206,45 +210,29 @@ class LICPolicy(Base):
     id = Column(Integer, primary_key=True)
     policy_name = Column(String, nullable=False)
     premium_amount = Column(Float, nullable=False)
-    frequency = Column(String, nullable=False)  # Monthly / Quarterly / Half-Yearly / Yearly
+    premium_frequency = Column(String, nullable=False)
     last_premium_date = Column(Date, nullable=True)
     maturity_date = Column(Date, nullable=False)
     maturity_amount = Column(Float, nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-
-
-# ======================
-# INVESTMENTS (STOCK / MF / ETF)
-# ======================
-class Investment(Base):
-    __tablename__ = "investments"
-
+class InvestmentCategory(Base):
+    __tablename__ = "investment_categories"
     id = Column(Integer, primary_key=True)
-    instrument = Column(String, nullable=False)      # Stock / MF / ETF
-    name = Column(String, nullable=False)            # TCS / NIFTY 50 / etc
+    name = Column(String, unique=True, nullable=False)
+class InvestmentEntry(Base):
+    __tablename__ = "investment_entries"
+    id = Column(Integer, primary_key=True)
+    category_id = Column(Integer, ForeignKey("investment_categories.id"), nullable=False)
     units = Column(Float, nullable=False)
     buy_price = Column(Float, nullable=False)
     buy_date = Column(Date, nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    category = relationship("InvestmentCategory")
 
-Base.metadata.create_all(bind=engine)  # create tables
-def migrate_appliances_schema():                         # migrate appliances table schema   
-    with engine.connect() as conn:                       # connect to db
-        existing_cols = conn.execute(                    # get existing columns   
-            text("PRAGMA table_info(appliances)")        # pragma query   
-        ).fetchall()
-        existing_cols = {c[1] for c in existing_cols}    # set of column names
 
-        if "warranty_expiry" not in existing_cols:       # if warranty_expiry not in cols   
-            conn.execute(
-                text("ALTER TABLE appliances ADD COLUMN warranty_expiry DATE") # alter table query
-            )
-        if "depreciation_years" not in existing_cols:    # if depreciation_years not in cols
-            conn.execute(
-                text("ALTER TABLE appliances ADD COLUMN depreciation_years INTEGER") # alter table query
-            )
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 
-migrate_appliances_schema() # migrate appliances schema
+SessionLocal = sessionmaker(bind=engine)
+
+Base.metadata.create_all(bind=engine)
 
 # ==============
 # CREATE TABLES
@@ -697,17 +685,6 @@ def black_page(canvas, doc):
 def is_edit_mode(aid):
     return st.session_state.get(f"edit_mode_{aid}", False)
 
-def lic_simple_section():
-    st.subheader("📜 LIC Policies (Simple)")
-
-    with SessionLocal() as db:
-        st.info("LIC simple section loaded")
-def investment_section():
-    st.subheader("📈 Stock / MF / ETF Investments")
-
-    with SessionLocal() as db:
-        st.info("Investment section loaded")
-
 
 # ==============
 # ADD EXPENSE
@@ -768,13 +745,13 @@ def add_expense():
                 st.rerun()
             else:
                 st.error("Amount must be greater than 0")
-        st.divider()
-
-    with st.expander("⚙️ Advanced (Expense Category Management)"):
-        manage_categories()
+        
     st.divider()
     with st.expander("🔍 Filter Expense Entries (Edit / Delete)"):
         manage_entries()
+    st.divider()
+    with st.expander("⚙️ Advanced (Expense Category Management)"):
+        manage_categories()
 
 
 
@@ -1786,7 +1763,10 @@ def manage_entries():
                         st.session_state.data_refresh += 1
                         flash("All filtered entries deleted")
                         st.rerun()
-
+                        
+# =================
+# EXPENSE DASHBOARD
+# =================
 def dashboard():
     st.title("📊 Dashboard")
 
@@ -1817,7 +1797,6 @@ def dashboard():
     week_start_ts = today_ts - pd.Timedelta(days=6)
     month_start_ts = today_ts.replace(day=1)
     year_start_ts = today_ts.replace(month=1, day=1)
-
     today_date = today_ts.date()
 
     # ============================
@@ -1931,8 +1910,7 @@ def dashboard():
     # ============================
     st.divider()
     st.subheader("📅 Period Filter")
-     
-
+    
     period_mode = st.radio(
         "Filter expenses by",
         ["Monthly", "Yearly", "Custom"],
@@ -2160,8 +2138,6 @@ def dashboard():
                 "Total",
                 f"₹ {table_df['Amount (₹)'].sum():,.2f}"
             )
-
-
     st.divider()
     advanced_analytics(period_df)
 
@@ -2265,9 +2241,6 @@ def dashboard():
                 f"₹ {total_value:,.2f}"
             )
 
-
-
-
 ## ======================================
 # INSIGHTS
 # ======================================
@@ -2279,7 +2252,8 @@ def insights():
     df = load_expense_data(st.session_state.data_refresh)
     if df.empty:
         st.info("No data available")
-        return
+        st.stop()
+
     df["date"] = pd.to_datetime(df["date"])
     avg_mode = st.radio(
         "Average Spend Period",
@@ -2368,6 +2342,7 @@ def insights():
         else:
             for sub, amt in top_subcategories.items():
                 st.write(f"**{sub}** — ₹ {amt:,.2f}")
+
     # ============================
     # CATEGORY TREND COMPARISON
     # ============================
@@ -2392,23 +2367,38 @@ def insights():
         .sum()
         .sort_index()
     )
+
     if len(monthly_sub) < 2:
         st.info("Not enough data for comparison")
-        return
-    last_month = monthly_sub.iloc[-1]
-    prev_month = monthly_sub.iloc[-2]
-    diff = last_month - prev_month
-    pct = (diff / prev_month) * 100 if prev_month != 0 else 0
-    direction = "higher" if diff > 0 else "lower"
-    arrow = "🔺" if diff > 0 else "🔻"
-    flash(
-        f"""
-        {arrow} You spent **₹ {abs(diff):,.2f} ({abs(pct):.1f}%)**
-        **{direction}** on **{sel_cat} → {sel_sub}**
-        compared to the previous month.
-        """
-    )
+    else:
+        last_month = monthly_sub.iloc[-1]
+        prev_month = monthly_sub.iloc[-2]
 
+        diff = last_month - prev_month
+
+        if prev_month == 0:
+            pct = 100.0
+        else:
+            pct = (diff / prev_month) * 100
+
+        if diff > 0:
+            direction = "higher"
+            arrow = "🔺"
+        elif diff < 0:
+            direction = "lower"
+            arrow = "🔻"
+        else:
+            direction = "the same"
+            arrow = "➖"
+
+        st.markdown(
+                f"""
+                ### {arrow} Spending Trend
+                You spent **₹ {abs(diff):,.2f} ({abs(pct):.1f}%)**
+                **{direction}** on **{sel_cat} → {sel_sub}**
+                compared to the previous month.
+                """
+            )
 
 # ================
 # PDF EXPORT FUNCTION
@@ -2816,6 +2806,12 @@ def assets_page():
                             fd.principal, fd.rate, fd.deposit_date
                         )
             db.commit()
+            
+            # ---------- LIC ----------
+            try:
+                lic_total = db.query(func.sum(LICPolicy.maturity_amount)).scalar() or 0.0
+            except Exception:
+                lic_total = 0.0
 
             # =====================================================
             # PRICE INPUTS (PERSISTENT)
@@ -2850,8 +2846,8 @@ def assets_page():
 
         with col1:
             df_main = pd.DataFrame({
-                "Category": ["Metals", "Land", "FDs"],
-                "Value": [metal_total, land_total, fd_total]
+            "Category": ["Metals", "Land", "FDs", "LIC"],
+            "Value": [metal_total, land_total, fd_total, lic_total]
             })
             fig1 = px.pie(df_main, names="Category", values="Value", hole=0.4)
             fig1.update_layout(paper_bgcolor="#000", font=dict(color="white"))
@@ -2859,8 +2855,31 @@ def assets_page():
             st.plotly_chart(fig1, use_container_width=True)
 
         with col2:
-            labels = ["Gold", "Silver"] + list(land_values.keys()) + ["FDs"]
-            values = [gold_value, silver_value] + list(land_values.values()) + [fd_total]
+            # ---------- LIC SUB-BREAKDOWN ----------
+            lic_rows = db.query(
+                LICPolicy.policy_name,
+                LICPolicy.maturity_amount
+            ).all()
+
+            lic_labels = [f"LIC – {r.policy_name}" for r in lic_rows]
+            lic_values = [r.maturity_amount for r in lic_rows]
+
+
+            # ---------- SUB PIE DATA ----------
+            labels = (
+                ["Gold", "Silver"]
+                + list(land_values.keys())
+                + ["FDs"]
+                + lic_labels
+            )
+
+            values = (
+                [gold_value, silver_value]
+                + list(land_values.values())
+                + [fd_total]
+                + lic_values
+            )
+
             df_sub = pd.DataFrame({"Asset": labels, "Value": values})
             fig2 = px.pie(df_sub, names="Asset", values="Value", hole=0.4)
             fig2.update_layout(paper_bgcolor="#000", font=dict(color="white"))
@@ -2872,30 +2891,32 @@ def assets_page():
         # =====================================================
         st.markdown("### 📌 Asset Valuation Summary")
 
-        c1, c2, c3 = st.columns(3)
+        st.metric(
+            "🪙 Metals Total",
+            f"₹ {metal_total:,.2f}",
+            help=f"Gold: ₹ {gold_value:,.2f} | Silver: ₹ {silver_value:,.2f}"
+        )
 
-        with c1:
-            st.metric(
-                "🪙 Metals Total",
-                f"₹ {metal_total:,.2f}",
-                help=f"Gold: ₹ {gold_value:,.2f} | Silver: ₹ {silver_value:,.2f}"
-            )
+        st.metric(
+            "🏞️ Land Total",
+            f"₹ {land_total:,.2f}",
+            help="Based on sqft × price per location"
+        )
 
-        with c2:
-            st.metric(
-                "🏞️ Land Total",
-                f"₹ {land_total:,.2f}",
-                help="Based on sqft × price per location"
-            )
+        st.metric(
+            "🏦 Fixed Deposits",
+            f"₹ {fd_total:,.2f}",
+            help="Current value of active FDs"
+        )
 
-        with c3:
-            st.metric(
-                "🏦 Fixed Deposits",
-                f"₹ {fd_total:,.2f}",
-                help="Current value of active FDs"
-            )
+        st.metric(
+            "📜 LIC Policies",
+            f"₹ {lic_total:,.2f}",
+            help="Total maturity value of all LIC policies"
+        )
 
-        grand_total_assets = metal_total + land_total + fd_total
+
+        grand_total_assets = metal_total + land_total + fd_total + lic_total
 
         st.divider()
 
@@ -3025,9 +3046,9 @@ def assets_page():
 
         with st.expander("🏦 Fixed Deposits", expanded=False):
 
-            # ======
-            # ADD FD
-            # ======
+            # ==============
+            # FIXED DEPOSITS
+            # ==============
             st.subheader("➕ Add Fixed Deposit")
 
             fd_name = st.text_input("FD Name")
@@ -3231,6 +3252,120 @@ def assets_page():
             else:
                 st.info("No matured fixed deposits")
 
+        # ===
+        # LIC
+        # ===
+        with st.expander("📜 LIC Policies", expanded=False):
+
+            st.subheader("➕ Add LIC Policy")
+
+            policy_name = st.text_input("Policy Name")
+            premium_amount = st.number_input("Premium Amount (₹)", min_value=0.0, step=100.0)
+            premium_frequency = st.selectbox(
+                "Premium Frequency",
+                ["Monthly", "Quarterly", "Half-Yearly", "Yearly"]
+            )
+            last_premium_date = st.date_input(
+                "Last Premium Date (optional)",
+                value=date.today()
+            )
+
+            no_last_premium = st.checkbox("No last premium date")
+
+            if no_last_premium:
+                last_premium_date = None
+
+            maturity_date = st.date_input("Maturity Date")
+            maturity_amount = st.number_input("Maturity Amount (₹)", min_value=0.0, step=1000.0)
+
+            if st.button("💾 Save LIC Policy"):
+                if policy_name and premium_amount > 0 and maturity_amount > 0:
+                    db.add(LICPolicy(
+                        policy_name=policy_name,
+                        premium_amount=premium_amount,
+                        premium_frequency=premium_frequency,
+                        last_premium_date=last_premium_date,
+                        maturity_date=maturity_date,
+                        maturity_amount=maturity_amount
+                    ))
+                    db.commit()
+                    st.rerun()
+                else:
+                    st.error("Please fill all mandatory LIC fields")
+
+            st.divider()
+
+            st.subheader("📋 LIC Policies")
+
+            try:
+                lic_df = pd.DataFrame(
+                    db.query(
+                        LICPolicy.id,
+                        LICPolicy.policy_name,
+                        LICPolicy.premium_amount,
+                        LICPolicy.premium_frequency,
+                        LICPolicy.last_premium_date,
+                        LICPolicy.maturity_date,
+                        LICPolicy.maturity_amount
+                    ).all(),
+                    columns=[
+                        "id",
+                        "Policy Name",
+                        "Premium Amount",
+                        "Frequency",
+                        "Last Premium Date",
+                        "Maturity Date",
+                        "Maturity Amount"
+                    ]
+                )
+            except Exception:
+                lic_df = pd.DataFrame()
+
+            if not lic_df.empty:
+                edited = st.data_editor(
+                    lic_df,
+                    disabled=["id"],
+                    use_container_width=True
+                )
+
+                if st.button("💾 Save LIC Changes"):
+                    for _, r in edited.iterrows():
+                        p = db.get(LICPolicy, int(r["id"]))
+                        if p:
+                            p.policy_name = r["Policy Name"]
+                            p.premium_amount = float(r["Premium Amount"])
+                            p.premium_frequency = r["Frequency"]
+                            p.last_premium_date = (
+                                pd.to_datetime(r["Last Premium Date"]).date()
+                                if pd.notna(r["Last Premium Date"]) else None
+                            )
+                            p.maturity_date = pd.to_datetime(r["Maturity Date"]).date()
+                            p.maturity_amount = float(r["Maturity Amount"])
+                    db.commit()
+                    st.rerun()
+
+                del_ids = st.multiselect(
+                    "Delete LIC Policies",
+                    lic_df["id"].tolist(),
+                    format_func=lambda x:
+                        lic_df.loc[lic_df.id == x, "Policy Name"].values[0]
+                )
+
+                if del_ids and st.button("❌ Delete Selected LIC Policies"):
+                    for i in del_ids:
+                        p = db.get(LICPolicy, int(i))
+                        if p:
+                            db.delete(p)
+                    db.commit()
+                    st.rerun()
+            else:
+                st.info("No LIC policies added yet")
+
+            st.metric(
+                "📜 Total LIC Value",
+                f"₹ {lic_total:,.2f}"
+            )
+
 
         # =====================================================
         # PDF EXPORT (ASSETS WITH TOTALS)
@@ -3243,11 +3378,11 @@ def assets_page():
 
             export_sections = st.multiselect(
                 "Select sections to include",
-                ["Metals", "Land", "Fixed Deposits"],
-                default=["Metals", "Land", "Fixed Deposits"]
+                ["Metals", "Land", "Fixed Deposits", "LIC"],
+                default=["Metals", "Land", "Fixed Deposits", "LIC"]
             )
 
-            if st.button("🧾 Generate PDF Report"):
+            if st.button("🧾 Generate PDF Report"):         
                 from reportlab.lib.pagesizes import A4
                 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
                 from reportlab.lib.styles import getSampleStyleSheet
@@ -3478,6 +3613,37 @@ def assets_page():
                     except Exception:
                         story.append(Paragraph("Fixed Deposits not available.", styles["BlackNormal"]))
 
+                # =====================================================
+                # LIC POLICIES
+                # =====================================================
+                if "LIC" in export_sections:
+                    lic_df = pd.read_sql("""
+                        SELECT policy_name, premium_amount, premium_frequency,
+                            last_premium_date, maturity_date, maturity_amount
+                        FROM lic_policies
+                    """, engine)
+
+                    if not lic_df.empty:
+                        total_lic = lic_df["maturity_amount"].sum()
+                        GRAND_TOTAL += total_lic
+
+                        story.append(Paragraph("<b>LIC Policies</b>", styles["BlackHeading"]))
+                        story.append(Spacer(1, 6))
+
+                        table_data = [list(lic_df.columns)] + lic_df.values.tolist()
+                        table_data.append(["TOTAL", "", "", "", "", f"{total_lic:,.2f}"])
+
+                        table = Table(table_data)
+                        table.setStyle(TableStyle([
+                            ("FONT", (0,0), (-1,-1), "DejaVu"),
+                            ("BACKGROUND", (0,0), (-1,0), colors.black),
+                            ("BACKGROUND", (0,1), (-1,-1), colors.black),
+                            ("TEXTCOLOR", (0,0), (-1,-1), colors.white),
+                            ("GRID", (0,0), (-1,-1), 0.5, colors.white),
+                        ]))
+
+                        story.append(table)
+                        story.append(Spacer(1, 14))
 
 
                 # ================= GRAND TOTAL =================
@@ -3702,7 +3868,10 @@ def appliances_page():
                 if a.images:
                     st.divider()
                     for img in a.images:
-                        col_img1, col_img2 = st.columns([4, 1])
+                        if show_thumbnails and os.path.exists(img.image_path):
+                            st.image(img.image_path, width=200)
+
+                        col_img1, col_img2, col_img3 = st.columns([4, 1, 1])
 
                         col_img1.write(os.path.basename(img.image_path))
 
@@ -3711,6 +3880,36 @@ def appliances_page():
                             key="openimg_" + str(img.id)
                         ):
                             open_image(img.image_path)
+
+                        if col_img3.button(
+                            "❌ Delete",
+                            key="delimg_" + str(img.id)
+                        ):
+                            st.session_state["confirm_img_" + str(img.id)] = True
+
+                    for img in a.images:
+                        key = "confirm_img_" + str(img.id)
+                        if st.session_state.get(key):
+                            st.warning("Delete this image permanently?")
+                            y, n = st.columns(2)
+
+                            if y.button("Yes", key="yesimg_" + str(img.id)):
+                                db = SessionLocal()
+                                img_db = db.get(ApplianceImage, img.id)
+
+                                if img_db:
+                                    if os.path.exists(img_db.image_path):
+                                        os.remove(img_db.image_path)
+
+                                    db.delete(img_db)
+                                    db.commit()
+                                    db.close()
+
+                                del st.session_state[key]
+                                st.rerun()
+
+                            if n.button("Cancel", key="noimg_" + str(img.id)):
+                                del st.session_state[key]
 
                 st.divider()
 
@@ -3967,7 +4166,9 @@ def appliances_page():
                         file_name="appliances_report.pdf",
                         mime="application/pdf"
                     )
-            
+
+
+
 st.markdown('<div id="breadcrumbs"></div>', unsafe_allow_html=True)
 
 # ======================
@@ -3983,7 +4184,7 @@ page = st.sidebar.radio(
     "🔌 Appliances Data",
     "💰 Income",
     "🏦 Assets",
-    "📈 Insights"
+    "📈 Insights",
     ],
     index =0
 )       
@@ -3995,8 +4196,8 @@ if "page_loaded" not in st.session_state:
 # If the page is loaded for the first time, set the flag
 st.session_state.page_loaded = True
 PAGE_ORDER = {
-    "Dashboard": 0,
-    "Expenses": 1,
+    "Expenses": 0,
+    "Dashboard": 1,
     "Income": 2,
     "Assets": 3,
     "Reports": 4
@@ -4048,3 +4249,4 @@ elif page == "🔌 Appliances Data":
     appliances_page()
 elif page == "📤 Export Expenses":
     export_data()
+

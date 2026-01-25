@@ -1,0 +1,704 @@
+# ======================
+# WORKOUT TRENDS DATAFRAME  
+# ======================
+def get_workout_trend_df(start, end):
+    with SessionLocal() as db:
+        df = pd.DataFrame(
+            db.query(
+                Workout.date,
+                Workout.exercise,
+                Workout.sets,
+                Workout.reps,
+                Workout.duration_min
+            )
+            .filter(Workout.date.between(start, end))
+            .all(),
+            columns=["date", "exercise", "sets", "reps", "duration"]
+        )
+
+    if df.empty:
+        return df
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    # reps-based volume
+    df["total_reps"] = (
+        df["sets"].fillna(0) * df["reps"].fillna(0)
+    )
+
+    return df
+
+
+# ======================
+# HABIT SECTIONS
+# ======================
+def habit_dashboard():
+    st.title("🧠 Habit Dashboard")
+
+    today = pd.Timestamp.today().normalize()
+
+    # =========================
+    # DAILY HEALTH – TODAY
+    # =========================
+    st.subheader("📅 Today · Daily Health")
+
+    with SessionLocal() as db:
+        dh = db.get(DailyHealth, today.date())
+
+    c1, c2, c3 = st.columns(3)
+
+    if dh:
+        c1.metric("💧 Water", f"{dh.water} glasses")
+        c2.metric("😴 Sleep", f"{dh.sleep} hrs")
+        c3.metric("⚖️ Weight", f"{dh.weight} kg")
+    else:
+        c1.metric("💧 Water", "—")
+        c2.metric("😴 Sleep", "—")
+        c3.metric("⚖️ Weight", "—")
+
+    # =========================
+    # WORKOUT SUMMARY
+    # =========================
+    # =========================
+    # WORKOUT TRENDS
+    # =========================
+    st.divider()
+    st.subheader("🏋️ Workout Trends")
+
+    today = pd.Timestamp.today().normalize()
+
+    # -------------------------
+    # LOAD ALL WORKOUT DATA FIRST
+    # -------------------------
+    with SessionLocal() as db:
+        df = pd.DataFrame(
+            db.query(
+                Workout.date,
+                Workout.exercise,
+                Workout.sets,
+                Workout.reps,
+                Workout.duration_min
+            ).all(),
+            columns=["date", "exercise", "sets", "reps", "duration"]
+        )
+
+    if df.empty:
+        st.info("No workout data available")
+        return
+
+    df["date"] = pd.to_datetime(df["date"])
+    df["total_reps"] = df["sets"].fillna(0) * df["reps"].fillna(0)
+
+    # -------------------------
+    # PERIOD FILTER
+    # -------------------------
+    period = st.radio(
+        "Period",
+        ["Weekly", "Monthly", "Custom"],
+        horizontal=True,
+        key="workout_trend_period"
+    )
+
+    if period == "Weekly":
+        start = today - pd.Timedelta(days=6)
+        end = today
+
+    elif period == "Monthly":
+        months = sorted(df["date"].dt.to_period("M").unique())
+        month_labels = [m.strftime("%b %Y") for m in months]
+
+        selected_label = st.selectbox(
+            "Select Month",
+            month_labels,
+            key="workout_trend_month"
+        )
+
+        selected_period = months[month_labels.index(selected_label)]
+        start = selected_period.to_timestamp()
+        end = (selected_period + 1).to_timestamp() - pd.Timedelta(seconds=1)
+
+    else:
+        start, end = st.date_input(
+            "Select date range",
+            [today - pd.Timedelta(days=7), today],
+            key="workout_trend_custom"
+        )
+        start = pd.Timestamp(start)
+        end = pd.Timestamp(end)
+
+    # -------------------------
+    # APPLY DATE FILTER
+    # -------------------------
+    df = df[df["date"].between(start, end)]
+
+    if df.empty:
+        st.info("No workout data for selected period")
+        return
+
+    # -------------------------
+    # SPLIT WORKOUT TYPES
+    # -------------------------
+    reps_exercises = [
+        "Push-ups",
+        "Squats",
+        "Bicep Curls",
+        "Tricep Pushbacks",
+        "Handgrip"
+    ]
+
+    time_exercises = [
+        "Walking",
+        "Step Climbing",
+        "Plank"
+    ]
+
+    # =========================
+    # REPS-BASED TREND
+    # =========================
+    st.markdown("### 🔢 Reps-Based Workouts")
+
+    reps_df = (
+        df[df["exercise"].isin(reps_exercises)]
+        .groupby(["date", "exercise"], as_index=False)["total_reps"]
+        .sum()
+    )
+
+    if reps_df.empty:
+        st.info("No reps-based workouts in this period")
+    else:
+        reps_df["date_only"] = reps_df["date"].dt.date
+
+        fig = px.line(
+            reps_df.assign(date_only=reps_df["date"].dt.date),
+            x="date_only",
+            y="total_reps",
+            color="exercise",
+            markers=True
+        )
+
+        fig.update_layout(
+            height=320,
+            paper_bgcolor="#000",
+            plot_bgcolor="#000",
+            font=dict(color="#fff"),
+            yaxis_title="Total Reps",
+            xaxis_title="Date",
+            xaxis_tickformat="%d %b"
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+
+    # =========================
+    # TIME-BASED TREND
+    # =========================
+    st.markdown("### ⏱ Time-Based Workouts")
+
+    time_df = (
+        df[df["exercise"].isin(time_exercises)]
+        .groupby(["date", "exercise"], as_index=False)["duration"]
+        .sum()
+    )
+
+    if time_df.empty:
+        st.info("No time-based workouts in this period")
+    else:
+        time_df["date_only"] = time_df["date"].dt.date
+
+        fig = px.line(
+            time_df.assign(date_only=time_df["date"].dt.date),
+            x="date_only",
+            y="duration",
+            color="exercise",
+            markers=True
+        )
+
+        fig.update_layout(
+            height=320,
+            paper_bgcolor="#000",
+            plot_bgcolor="#000",
+            font=dict(color="#fff"),
+            yaxis_title="Minutes",
+            xaxis_title="Date",
+            xaxis_tickformat="%d %b"
+
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+    # =========================
+    # PER-WORKOUT MISSED DAYS
+    # =========================
+    st.divider()
+    st.subheader("❌ Missed Days by Workout")
+
+    # All days in selected range
+    all_days = pd.date_range(start=start, end=end, freq="D")
+    total_days = len(all_days)
+
+    # Fixed workout list (important)
+    all_exercises = [
+        "Push-ups",
+        "Squats",
+        "Bicep Curls",
+        "Tricep Pushbacks",
+        "Handgrip",
+        "Walking",
+        "Step Climbing",
+        "Plank"
+    ]
+
+    missed_data = []
+
+    for exercise in all_exercises:
+        done_days = (
+            df[df["exercise"] == exercise]["date"]
+            .dt.normalize()
+            .nunique()
+        )
+
+        missed_days = total_days - done_days
+
+        missed_data.append({
+            "Workout": exercise,
+            "Missed Days": missed_days
+        })
+
+    missed_df = pd.DataFrame(missed_data)
+
+    # Optional: sort by most missed
+    missed_df = missed_df.sort_values(
+        by="Missed Days",
+        ascending=False
+    )
+
+    # Display as simple table
+    st.dataframe(
+        missed_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.divider()
+    st.subheader("📈 Progressive Reps")
+
+    exercise = st.selectbox(
+        "Select Exercise",
+        reps_exercises,
+        key="progress_exercise"
+    )
+
+    ex_df = df[df["exercise"] == exercise].copy()
+
+    if ex_df.empty:
+        st.info("No data for selected exercise")
+        return
+    
+    if period == "Weekly":
+        st.markdown("### 🔁 Weekly Progressive Reps")
+
+        # This week (Mon–Sun)
+        this_week_start = today - pd.Timedelta(days=today.weekday())
+        this_week_end = this_week_start + pd.Timedelta(days=6)
+
+        # Last week (Mon–Sun)
+        last_week_start = this_week_start - pd.Timedelta(days=7)
+        last_week_end = this_week_start - pd.Timedelta(days=1)
+
+        this_week_reps = ex_df[
+            ex_df["date"].between(this_week_start, this_week_end)
+        ]["total_reps"].sum()
+
+        last_week_reps = ex_df[
+            ex_df["date"].between(last_week_start, last_week_end)
+        ]["total_reps"].sum()
+
+        if last_week_reps == 0:
+            st.info("Not enough data to compare with last week")
+        else:
+            progress = ((this_week_reps - last_week_reps) / last_week_reps) * 100
+
+            st.metric(
+                "Weekly Progress",
+                f"{this_week_reps} reps",
+                f"{progress:+.2f}%"
+            )
+    elif period == "Monthly":
+        st.markdown("### 📅 Monthly Progressive Reps")
+
+        # This month
+        this_month_start = today.replace(day=1)
+
+        # Last month
+        last_month_end = this_month_start - pd.Timedelta(days=1)
+        last_month_start = last_month_end.replace(day=1)
+
+        this_month_reps = ex_df[
+            ex_df["date"].between(this_month_start, today)
+        ]["total_reps"].sum()
+
+        last_month_reps = ex_df[
+            ex_df["date"].between(last_month_start, last_month_end)
+        ]["total_reps"].sum()
+
+        if last_month_reps == 0:
+            st.info("Not enough data to compare with last month")
+        else:
+            progress = ((this_month_reps - last_month_reps) / last_month_reps) * 100
+
+            st.metric(
+                "Monthly Progress",
+                f"{this_month_reps} reps",
+                f"{progress:+.2f}%"
+            )
+
+
+
+    # ==================
+    # FOOD (PLACEHOLDER)
+    # ==================
+    st.divider()
+    st.subheader("🍽 Food")
+
+    st.info("Food tracking summary will appear here")
+
+
+# ===============
+# WORKOUT SECTION
+# ===============
+def habit_workout():
+    st.title("🏋️ Workout Tracker")
+
+    exercises = [
+        "Push-ups",
+        "Squats",
+        "Bicep Curls",
+        "Tricep Pushbacks",
+        "Handgrip",
+        "Walking",
+        "Step Climbing",
+        "Plank"
+    ]
+
+    with SessionLocal() as db:
+        # ============
+        # ADD WORKOUT
+        # ============
+        st.subheader("➕ Add Workout")
+
+        workout_date = st.date_input("Workout Date", value=date.today())
+        exercise = st.selectbox("Exercise", exercises)
+
+        is_time_based = exercise in ["Walking", "Step Climbing", "Plank"]
+
+        col1, col2 = st.columns(2)
+
+        if is_time_based:
+            with col1:
+                duration = st.number_input(
+                    "Duration (minutes)",
+                    min_value=0.0,
+                    step=1.0
+                )
+            sets = reps = None
+        else:
+            with col1:
+                sets = st.number_input("Sets", min_value=1, step=1)
+            with col2:
+                reps = st.number_input("Reps per set", min_value=1, step=1)
+            duration = None
+
+        if st.button("💾 Save Workout"):
+            db.add(
+                Workout(
+                    date=workout_date,
+                    exercise=exercise,
+                    sets=sets,
+                    reps=reps,
+                    duration_min=duration
+                )
+            )
+            db.commit()
+            st.success("Workout saved ✅")
+            st.rerun()
+
+        # ========
+        # FILTERS
+        # ========
+        st.divider()
+        st.subheader("🔍 Filters")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            date_filter = st.radio(
+                "Date Filter",
+                ["Last 7 Days", "Monthly", "Yearly", "Custom"],
+                horizontal=True
+            )
+
+        with col2:
+            exercise_filter = st.selectbox(
+                "Exercise Type",
+                ["All"] + exercises
+            )
+
+        today = date.today()
+
+        if date_filter == "Last 7 Days":
+            start = today - timedelta(days=6)
+            end = today
+
+        elif date_filter == "Monthly":
+            months = (
+                db.query(func.strftime("%Y-%m", Workout.date))
+                .distinct()
+                .order_by(func.strftime("%Y-%m", Workout.date))
+                .all()
+            )
+
+            if not months:
+                st.info("No workout data available for monthly filter")
+                return
+
+            labels = [
+                pd.to_datetime(m[0] + "-01").strftime("%b %Y")
+                for m in months
+            ]
+
+            sel = st.selectbox("Select Month", labels)
+            idx = labels.index(sel)
+
+            start = pd.to_datetime(months[idx][0] + "-01").date()
+            end = (pd.to_datetime(start) + pd.offsets.MonthEnd(1)).date()
+
+        elif date_filter == "Yearly":
+            years = sorted({
+                int(y[0]) for y in
+                db.query(func.strftime("%Y", Workout.date)).all()
+            })
+
+            if not years:
+                st.info("No workout data available for yearly filter")
+                return
+
+            year = st.selectbox("Select Year", years)
+
+            start = date(year, 1, 1)
+            end = date(year, 12, 31)
+
+        else:
+            start, end = st.date_input(
+                "Custom Date Range",
+                [today.replace(day=1), today]
+            )
+
+        # ===================
+        # LOAD FILTERED DATA
+        # ===================
+        q = (
+            db.query(
+                Workout.id,
+                Workout.date,
+                Workout.exercise,
+                Workout.sets,
+                Workout.reps,
+                Workout.duration_min
+            )
+            .filter(Workout.date.between(start, end))
+        )
+
+        if exercise_filter != "All":
+            q = q.filter(Workout.exercise == exercise_filter)
+
+        df = pd.DataFrame(
+            q.order_by(Workout.date.desc()).all(),
+            columns=["id", "date", "exercise", "sets", "reps", "duration_min"]
+        )
+
+        if df.empty:
+            st.info("No workouts found for selected filters")
+            return
+
+        df["date"] = pd.to_datetime(df["date"])
+
+        # ===========
+        # ACTION MODE
+        # ===========
+        st.divider()
+        action = st.radio(
+            "Action",
+            ["Edit Entries", "Delete Entries"],
+            horizontal=True
+        )
+
+        # =========
+        # EDIT MODE
+        # =========
+        if action == "Edit Entries":
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                disabled=["id"],
+                column_config={
+                    "date": st.column_config.DateColumn("Date"),
+                    "exercise": st.column_config.SelectboxColumn(
+                        "Exercise",
+                        options=exercises
+                    ),
+                    "sets": st.column_config.NumberColumn("Sets", min_value=0),
+                    "reps": st.column_config.NumberColumn("Reps", min_value=0),
+                    "duration_min": st.column_config.NumberColumn(
+                        "Duration (min)",
+                        min_value=0.0
+                    ),
+                }
+            )
+
+            if st.button("💾 Save Changes"):
+                with db.no_autoflush:
+                    for _, row in edited_df.iterrows():
+                        w = db.get(Workout, int(row["id"]))
+                        if not w:
+                            continue
+                        w.date = pd.to_datetime(row["date"]).date()
+                        w.exercise = row["exercise"]
+                        w.sets = int(row["sets"]) if not pd.isna(row["sets"]) else None
+                        w.reps = int(row["reps"]) if not pd.isna(row["reps"]) else None
+                        w.duration_min = (
+                            float(row["duration_min"])
+                            if not pd.isna(row["duration_min"])
+                            else None
+                        )
+                db.commit()
+                st.success("Workout entries updated ✅")
+                st.rerun()
+
+        # ============
+        # DELETE MODE
+        # ============
+        else:
+            delete_mode = st.radio(
+                "Delete Option",
+                ["Delete selected rows", "Delete ALL filtered rows"],
+                horizontal=True
+            )
+
+            df_del = df.copy()
+            df_del["date"] = df_del["date"].dt.strftime("%Y-%m-%d")
+
+            if delete_mode == "Delete selected rows":
+                gb = GridOptionsBuilder.from_dataframe(df_del)
+                gb.configure_column("date", checkboxSelection=True, headerCheckboxSelection=True)
+                gb.configure_column("id", hide=True)
+                gb.configure_grid_options(
+                    rowSelection="multiple",
+                    suppressRowClickSelection=True
+                )
+
+                grid = AgGrid(
+                    df_del,
+                    gridOptions=gb.build(),
+                    update_mode=GridUpdateMode.MODEL_CHANGED,
+                    fit_columns_on_grid_load=True
+                )
+
+                selected = pd.DataFrame(grid["selected_rows"])
+
+                if not selected.empty:
+                    st.warning(f"Selected rows: {len(selected)}")
+
+                    if st.checkbox("Confirm delete selected workouts"):
+                        if st.button("❌ Delete Selected"):
+                            for _, row in selected.iterrows():
+                                w = db.get(Workout, int(row["id"]))
+                                if w:
+                                    db.delete(w)
+                            db.commit()
+                            st.success("Selected workouts deleted")
+                            st.rerun()
+
+            else:
+                st.warning(f"This will delete ALL {len(df)} filtered workouts")
+                if st.checkbox("I understand this is permanent"):
+                    if st.button("❌ Delete ALL Filtered"):
+                        for _, row in df.iterrows():
+                            w = db.get(Workout, int(row["id"]))
+                            if w:
+                                db.delete(w)
+                        db.commit()
+                        st.success("All filtered workouts deleted")
+                        st.rerun()
+
+
+def habit_water():
+    st.title("💧 Water")
+    st.info("Water intake tracking coming soon")
+
+def habit_food():
+    st.title("🍽 Food")
+    st.info("Food tracking coming soon")
+
+
+def habit_daily_health():
+    st.title("💧😴⚖️ Daily Health")
+
+    with SessionLocal() as db:
+        date_selected = st.date_input("Date", value=date.today())
+
+        existing = db.get(DailyHealth, date_selected)
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            water = st.number_input(
+                "💧 Water (Litres)",
+                min_value=0,
+                max_value=30,
+                step=1,
+                value=existing.water if existing else 0
+            )
+
+        with col2:
+            sleep_hours = st.number_input(
+                "😴 Sleep (hours)",
+                min_value=0.0,
+                max_value=24.0,
+                step=0.5,
+                value=existing.sleep if existing else 0.0
+            )
+
+        with col3:
+            weight = st.number_input(
+                "⚖️ Weight (kg)",
+                min_value=0.0,
+                max_value=300.0,
+                step=0.1,
+                value=existing.weight if existing else 0.0
+            )
+
+        if st.button("💾 Save Daily Health"):
+            if existing:
+                existing.water = water
+                existing.sleep = sleep_hours
+                existing.weight = weight
+            else:
+                db.add(
+                    DailyHealth(
+                        date=date_selected,
+                        water=water,
+                        sleep=sleep_hours,
+                        weight=weight
+                    )
+                )
+            db.commit()
+            st.success("Daily health saved ✅")
+            st.rerun()
+
+
+def habit_insights():
+    st.title("📈 Habit Insights")
+    st.info("Habit insights coming soon")
+
+def habit_export():
+    st.title("📤 Habit Export")
+    st.info("Habit export coming soon")
