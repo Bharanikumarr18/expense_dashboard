@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import datetime
-from datetime import date, time
 from datetime import date, timedelta
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm import joinedload
@@ -13,9 +12,9 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 import plotly.express as px
+import plotly.graph_objects as go
 import io
 from io import BytesIO
-import subprocess
 import json
 import re
 from reportlab.lib.pagesizes import A4
@@ -30,7 +29,11 @@ from reportlab.lib.styles import getSampleStyleSheet
 import requests
 import matplotlib.pyplot as plt
 from dateutil.relativedelta import relativedelta
-import os, time, platform, subprocess
+import os
+import platform
+import time
+import subprocess
+
 
 
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
@@ -73,23 +76,25 @@ st.set_page_config(
 # ==============
 DATABASE_URL = st.secrets.get(
     "DATABASE_URL",
-    "sqlite:///expense.db"  # fallback for local use
+    "sqlite:///expense.db"
 )
-DB_URL = "sqlite:///expense.db"
+
+engine_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    engine_args["connect_args"] = {"check_same_thread": False}
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True
+    pool_pre_ping=True,
+    **engine_args
 )
 
-# ==============
-# SESSION LOCAL
-# ==============
 SessionLocal = sessionmaker(
     bind=engine,
     autoflush=False,
     expire_on_commit=False
 )
+
 
 def get_db():
     return SessionLocal()
@@ -226,11 +231,6 @@ class InvestmentEntry(Base):
     buy_price = Column(Float, nullable=False)
     buy_date = Column(Date, nullable=False)
     category = relationship("InvestmentCategory")
-
-
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
-
-SessionLocal = sessionmaker(bind=engine)
 
 Base.metadata.create_all(bind=engine)
 
@@ -563,7 +563,103 @@ st.markdown(
         }
     }
 
+    /* ===============================
+    JS-DRIVEN REVEAL ANIMATIONS
+    =============================== */
+    .js-reveal {
+        opacity: 0;
+        transform: translateY(6px) scale(0.99);
+        transition: opacity 0.22s ease-out, transform 0.22s ease-out;
+        will-change: opacity, transform;
+    }
+
+    .js-reveal.is-visible {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+
+    .js-reveal[data-anim="pop"] {
+        transform: translateY(4px) scale(0.97);
+    }
+
+    .js-reveal[data-anim="slide"] {
+        transform: translateX(8px);
+    }
+
+    .js-reveal[data-anim="fade"] {
+        transform: none;
+    }
+
     </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    """
+    <script>
+    (function () {
+      if (!window.__uiAnimObserver) {
+        window.__uiAnimObserver = new IntersectionObserver(function(entries) {
+          entries.forEach(function(entry) {
+            if (entry.isIntersecting) {
+              entry.target.classList.add("is-visible");
+              window.__uiAnimObserver.unobserve(entry.target);
+            }
+          });
+        }, { threshold: 0.12 });
+      }
+
+      const targets = [
+        "button",
+        "section[data-testid='stSidebar']",
+        "div[data-testid='stMetric']",
+        "div[data-testid='stMetricValue']",
+        "div[data-testid='stDataFrame']",
+        ".stDataFrame",
+        ".stPlotlyChart",
+        ".js-plotly-plot",
+        ".stAlert",
+        ".stExpander",
+        ".stTabs",
+        ".stForm",
+        ".stDownloadButton",
+        "div[data-baseweb='select']",
+        "div[data-baseweb='input']",
+        "div[data-baseweb='datepicker']",
+        "div[data-baseweb='textarea']"
+      ];
+
+      function applyReveal() {
+        const elements = document.querySelectorAll(targets.join(","));
+        let idx = 0;
+        elements.forEach(function(el) {
+          if (el.dataset.animInit) return;
+          el.dataset.animInit = "1";
+          el.classList.add("js-reveal");
+
+          const tag = el.tagName.toLowerCase();
+          if (tag === "button") el.dataset.anim = "pop";
+          else if (el.classList.contains("stPlotlyChart") || el.classList.contains("js-plotly-plot")) el.dataset.anim = "fade";
+          else el.dataset.anim = "slide";
+
+          const delay = Math.min(idx, 15) * 18;
+          el.style.transitionDelay = delay + "ms";
+          window.__uiAnimObserver.observe(el);
+          idx += 1;
+        });
+      }
+
+      applyReveal();
+
+      if (!window.__uiAnimMO) {
+        window.__uiAnimMO = new MutationObserver(function() {
+          applyReveal();
+        });
+        window.__uiAnimMO.observe(document.body, { childList: true, subtree: true });
+      }
+    })();
+    </script>
     """,
     unsafe_allow_html=True
 )
@@ -585,43 +681,41 @@ def section(title, desc):
     st.subheader(title)
     st.caption(desc)
 
-
 def cumulative_spend_chart(df):
-    section(
-        "📈 Cumulative Spending Curve",
-        "Shows how your total expenses accumulate over time. Useful to detect spending acceleration."
-    )
+    with st.expander("📈 Cumulative Spending Curve", expanded=False):
+        st.caption(
+            "Shows how your total expenses accumulate over time. Useful to detect spending acceleration."
+        )
 
-    mode = st.radio(
-        "Aggregation Level",
-        ["Daily", "Monthly"],
-        horizontal=True,
-        key="cum_agg"
-    )
+        mode = st.radio(
+            "Aggregation Level",
+            ["Daily", "Monthly"],
+            horizontal=True,
+            key="cum_agg"
+        )
 
-    data = df.copy()
+        data = df.copy()
 
-    if mode == "Monthly":
-        data["period"] = data["date"].dt.to_period("M").dt.to_timestamp()
-        grp = data.groupby("period", as_index=False)["amount"].sum()
-        x = "period"
-    else:
-        grp = data.groupby("date", as_index=False)["amount"].sum()
-        x = "date"
+        if mode == "Monthly":
+            data["period"] = data["date"].dt.to_period("M").dt.to_timestamp()
+            grp = data.groupby("period", as_index=False)["amount"].sum()
+            x = "period"
+        else:
+            grp = data.groupby("date", as_index=False)["amount"].sum()
+            x = "date"
 
-    grp["cumulative"] = grp["amount"].cumsum()
+        grp["cumulative"] = grp["amount"].cumsum()
 
-    fig = px.line(grp, x=x, y="cumulative", markers=True)
-    fig.update_layout(
-    plot_bgcolor="#000000",
-    paper_bgcolor="#000000",
-    font=dict(color="white"),
-    xaxis=dict(gridcolor="#222222"),
-    yaxis=dict(gridcolor="#222222")
-)
+        fig = px.line(grp, x=x, y="cumulative", markers=True)
+        fig.update_layout(
+            plot_bgcolor="#000000",
+            paper_bgcolor="#000000",
+            font=dict(color="white"),
+            xaxis=dict(gridcolor="#222222"),
+            yaxis=dict(gridcolor="#222222")
+        )
 
-
-    st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
     
 
 def advanced_analytics(period_df):
@@ -749,7 +843,6 @@ def add_expense():
     st.divider()
     with st.expander("🔍 Filter Expense Entries (Edit / Delete)"):
         manage_entries()
-    st.divider()
     with st.expander("⚙️ Advanced (Expense Category Management)"):
         manage_categories()
 
@@ -841,6 +934,7 @@ def income_section():
             )
             .join(IncomeCategory, Income.category_id == IncomeCategory.id)
             .join(IncomeSubCategory, Income.subcategory_id == IncomeSubCategory.id)
+            .order_by(Income.date.desc(), Income.id.desc())
             .all(),
             columns=["id", "date", "amount", "category", "subcategory"]
         )
@@ -848,6 +942,7 @@ def income_section():
             st.info("No income data available")
             return
         df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values(["date", "id"], ascending=[False, False]).reset_index(drop=True)
         # =================
         # PERIOD FILTER
         # =================
@@ -888,6 +983,7 @@ def income_section():
             start = pd.to_datetime(start)
             end = pd.to_datetime(end)
         period_df = df[df["date"].between(start, end)]
+        period_df = period_df.sort_values(["date", "id"], ascending=[False, False]).reset_index(drop=True)
         # ========================
         # INCOME SUMMARY + VISUALS
         # ========================
@@ -956,6 +1052,7 @@ def income_section():
                 filtered_df = filtered_df[filtered_df["category"] == f_cat]
             if f_sub != "All":
                 filtered_df = filtered_df[filtered_df["subcategory"] == f_sub]
+            filtered_df = filtered_df.sort_values(["date", "id"], ascending=[False, False]).reset_index(drop=True)
             if filtered_df.empty:
                 st.info("No income entries found")
                 return
@@ -1009,8 +1106,14 @@ def income_section():
                 del_df = filtered_df.copy()
                 del_df["date"] = pd.to_datetime(del_df["date"]).dt.strftime("%Y-%m-%d")
                 gb = GridOptionsBuilder.from_dataframe(del_df)
-                gb.configure_column("date", checkboxSelection=True, headerCheckboxSelection=True)
-                gb.configure_column("id", hide=True)
+                gb.configure_column(
+                    "date",
+                    checkboxSelection=True,
+                    headerCheckboxSelection=True,
+                    sort="desc",
+                    sortIndex=0
+                )
+                gb.configure_column("id", hide=True, sort="desc", sortIndex=1)
                 gb.configure_grid_options(rowSelection="multiple", suppressRowClickSelection=True)
                 grid = AgGrid(
                     del_df,
@@ -1225,8 +1328,9 @@ def income_section():
                 )
                 .join(IncomeCategory, Income.category_id == IncomeCategory.id)
                 .join(IncomeSubCategory, Income.subcategory_id == IncomeSubCategory.id)
+                .order_by(Income.date.desc(), Income.id.desc())
                 .all(),
-                columns=["NOs", "date", "amount", "category", "subcategory"]
+                columns=["ID", "date", "amount", "category", "subcategory"]
             )
 
             if income_df.empty:
@@ -1293,6 +1397,7 @@ def income_section():
             # APPLY FILTERS
             # -------------------------------
             fdf = income_df[income_df["date"].between(start_date, end_date)]
+            fdf = fdf.sort_values("date", ascending=False)
 
             if sel_category != "All":
                 fdf = fdf[fdf["category"] == sel_category]
@@ -1335,6 +1440,16 @@ def income_section():
                 ))
 
                 story = []
+                story.append(Paragraph(
+                    f"""
+                    Period: {start_date.date()} → {end_date.date()}<br/>
+                    Category: {sel_category}<br/>
+                    Subcategory: {sel_subcategory}
+                    """,
+                    styles["WhiteNormal"]
+                ))
+                story.append(Spacer(1, 12))
+
 
                 # ---------- TITLE ----------
                 story.append(Paragraph("Income Report", styles["WhiteTitle"]))
@@ -1351,7 +1466,7 @@ def income_section():
                 total_income = fdf["amount"].sum()
 
                 table_data = [list(fdf.columns)] + fdf.values.tolist()
-                table_data.append(["", "", "TOTAL", "", f"{total_income:,.2f}"])
+                table_data.append(["", "", "", "TOTAL", f"{total_income:,.2f}"])
 
                 table = Table(table_data, repeatRows=1)
                 table.setStyle(TableStyle([
@@ -1385,12 +1500,22 @@ def income_section():
                     onLaterPages=black_bg
                 )
 
+                file_name = f"income_report_{start_date.date()}_{end_date.date()}.pdf"
+
                 st.download_button(
                     "⬇️ Download Income PDF",
                     data=buffer.getvalue(),
-                    file_name="income_report.pdf",
+                    file_name=file_name,
                     mime="application/pdf"
                 )
+
+                st.download_button(
+                    "⬇️ Download CSV",
+                    data=fdf.to_csv(index=False),
+                    file_name="income_report.csv",
+                    mime="text/csv"
+                )
+
     
 
 
@@ -1667,6 +1792,7 @@ def manage_entries():
             .join(Category, Expense.category_id == Category.id)
             .join(SubCategory, Expense.subcategory_id == SubCategory.id)
             .filter(Expense.date.between(start, end))
+            .order_by(Expense.date.desc(), Expense.id.desc())
         )
         if sel_cat != "All":
             q = q.filter(Category.name == sel_cat)
@@ -1674,6 +1800,8 @@ def manage_entries():
             q = q.filter(SubCategory.name == sel_sub)
 
         df = pd.DataFrame(q.all(), columns=["id", "date", "category", "subcategory", "amount"])
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values(["date", "id"], ascending=[False, False]).reset_index(drop=True)
         if df.empty:
             st.info("No entries found")
             return
@@ -1729,8 +1857,14 @@ def manage_entries():
             df_del["date"] = pd.to_datetime(df_del["date"]).dt.strftime("%Y-%m-%d")
             if delete_mode == "Delete selected rows":
                 gb = GridOptionsBuilder.from_dataframe(df_del)
-                gb.configure_column("date", checkboxSelection=True, headerCheckboxSelection=True)
-                gb.configure_column("id", hide=True)
+                gb.configure_column(
+                    "date",
+                    checkboxSelection=True,
+                    headerCheckboxSelection=True,
+                    sort="desc",
+                    sortIndex=0
+                )
+                gb.configure_column("id", hide=True, sort="desc", sortIndex=1)
                 gb.configure_grid_options(rowSelection="multiple", suppressRowClickSelection=True)
                 grid = AgGrid(
                     df_del,
@@ -1871,16 +2005,24 @@ def dashboard():
                     f"• **{row['subcategory']}** — ₹ {row['amount']:,.0f}"
                 )
 
-        daily_total = (
-            db.query(func.sum(Expense.amount))
-            .filter(Expense.date == selected_date)
-            .scalar()
-        ) or 0
+        # ========================
+        # DATABASE ENTRY COUNT (LIVE)
+        # ========================
+        total_entries = sum((
+            db.query(func.count(Expense.id)).scalar() or 0,
+            db.query(func.count(Income.id)).scalar() or 0,
+            db.query(func.count(MetalAsset.id)).scalar() or 0,
+            db.query(func.count(LandAsset.id)).scalar() or 0,
+            db.query(func.count(FixedDeposit.id)).scalar() or 0,
+            db.query(func.count(Appliance.id)).scalar() or 0,
+            db.query(func.count(LICPolicy.id)).scalar() or 0,
+            db.query(func.count(InvestmentEntry.id)).scalar() or 0,
+        ))
 
         st.sidebar.divider()
         st.sidebar.metric(
-            f"Total · {selected_date.strftime('%d %b')}",
-            f"₹ {daily_total:,.0f}"
+            "Total Entries So Far",
+            f"{total_entries:,}"
         )
 
         # ========================
@@ -1909,201 +2051,202 @@ def dashboard():
     # PERIOD FILTER (CHARTS)
     # ============================
     st.divider()
-    st.subheader("📅 Period Filter")
+    with st.expander("📅 Period Filter & Pie Charts", expanded=False):
     
-    period_mode = st.radio(
-        "Filter expenses by",
-        ["Monthly", "Yearly", "Custom"],
-        horizontal=True,
-        key="dashboard_period_filter"
-    )
-
-    if period_mode == "Monthly":
-        months = sorted(df["date"].dt.to_period("M").unique())
-        labels = [m.strftime("%b %Y") for m in months]
-        current_period = today_ts.to_period("M")
-        default_index = months.index(current_period) if current_period in months else len(months) - 1
-
-        sel = st.selectbox("Select Month", labels, index=default_index)
-        sel_period = months[labels.index(sel)]
-        start_ts = sel_period.to_timestamp()
-        end_ts = (sel_period + 1).to_timestamp() - pd.Timedelta(seconds=1)
-
-    elif period_mode == "Yearly":
-        years = sorted(df["date"].dt.year.unique())
-        year = st.selectbox("Select Year", years)
-        start_ts = pd.Timestamp(year=year, month=1, day=1)
-        end_ts = pd.Timestamp(year=year, month=12, day=31)
-
-    else:
-        start, end = st.date_input(
-            "Select date range",
-            [month_start_ts.date(), today_date]
-        )
-        start_ts = pd.Timestamp(start)
-        end_ts = pd.Timestamp(end)
-
-    period_df = df[df["date"].between(start_ts, end_ts)]
-
-    with SessionLocal() as db:
-        total_spend = (
-            db.query(func.sum(Expense.amount))
-            .filter(Expense.date.between(start_ts.date(), end_ts.date()))
-            .scalar()
-        ) or 0
-
-    st.markdown(f"## 💰 Total for selected period: ₹ {total_spend:,.2f}")
-
-    # ============================
-    # SIDE-BY-SIDE CATEGORY / SUBCATEGORY CHARTS
-    # ============================
-
-    # ---- Chart view toggle
-    chart_view = st.radio(
-        "Chart View",
-        ["Pie Chart", "Bar Chart"],
-        horizontal=True,
-        key="dashboard_chart_view"
-    )
-
-    # ---- Category aggregation
-    cat_df = (
-        period_df.groupby("category", as_index=False)["amount"]
-        .sum()
-        .sort_values("amount", ascending=False)
-    )
-
-    if cat_df.empty:
-        st.info("No data for selected period")
-        return
-
-    col1, col2 = st.columns(2)
-
-    # =====================
-    # CATEGORY CHART
-    # =====================
-    with col1:
-        st.subheader("By Category")
-
-        cat_df["percent"] = (
-            cat_df["amount"] / cat_df["amount"].sum() * 100
-        ).round(1)
-
-        fig_cat = px.pie(
-            cat_df,
-            names="category",
-            values="amount",
-            hole=0.4
+        period_mode = st.radio(
+            "Filter expenses by",
+            ["Monthly", "Yearly", "Custom"],
+            horizontal=True,
+            key="dashboard_period_filter"
         )
 
-        fig_cat.update_traces(
-            texttemplate="%{customdata}%",
-            customdata=cat_df["percent"],
-            hovertemplate="<b>%{label}</b><br>₹ %{value:,.0f}<br>%{customdata}%<extra></extra>"
+        if period_mode == "Monthly":
+            months = sorted(df["date"].dt.to_period("M").unique())
+            labels = [m.strftime("%b %Y") for m in months]
+            current_period = today_ts.to_period("M")
+            default_index = months.index(current_period) if current_period in months else len(months) - 1
+
+            sel = st.selectbox("Select Month", labels, index=default_index)
+            sel_period = months[labels.index(sel)]
+            start_ts = sel_period.to_timestamp()
+            end_ts = (sel_period + 1).to_timestamp() - pd.Timedelta(seconds=1)
+
+        elif period_mode == "Yearly":
+            years = sorted(df["date"].dt.year.unique())
+            year = st.selectbox("Select Year", years)
+            start_ts = pd.Timestamp(year=year, month=1, day=1)
+            end_ts = pd.Timestamp(year=year, month=12, day=31)
+
+        else:
+            start, end = st.date_input(
+                "Select date range",
+                [month_start_ts.date(), today_date]
+            )
+            start_ts = pd.Timestamp(start)
+            end_ts = pd.Timestamp(end)
+
+        period_df = df[df["date"].between(start_ts, end_ts)]
+
+        with SessionLocal() as db:
+            total_spend = (
+                db.query(func.sum(Expense.amount))
+                .filter(Expense.date.between(start_ts.date(), end_ts.date()))
+                .scalar()
+            ) or 0
+
+        st.markdown(f"## 💰 Total for selected period: ₹ {total_spend:,.2f}")
+
+
+        # ============================
+        # SIDE-BY-SIDE CATEGORY / SUBCATEGORY CHARTS
+        # ============================
+
+        # ---- Chart view toggle
+        chart_view = st.radio(
+            "Chart View",
+            ["Pie Chart", "Bar Chart"],
+            horizontal=True,
+            key="dashboard_chart_view"
         )
 
-        fig_cat.update_layout(
-            height=480,
-            margin=dict(l=20, r=20, t=40, b=140),
-            legend=dict(
-                orientation="h",
-                yanchor="top",
-                y=-0.35,
-                xanchor="center",
-                x=0.5
-            ),
-            legend_itemclick=False,
-            legend_itemdoubleclick=False,
-            paper_bgcolor="#000",
-            font=dict(color="#fff")
-        )
-        fig_cat.update_traces(marker=dict(line=dict(color="black", width=2)))
-
-        st.plotly_chart(fig_cat, use_container_width=True)
-
-    # =====================
-    # SUBCATEGORY CHART
-    # =====================
-    with col2:
-        st.subheader("By Subcategory")
-
-        selected_category = st.selectbox(
-            "Select Category",
-            cat_df["category"].tolist(),
-            key="subcategory_chart_category"
-        )
-
-        sub_df = (
-            period_df[period_df["category"] == selected_category]
-            .groupby("subcategory", as_index=False)["amount"]
+        # ---- Category aggregation
+        cat_df = (
+            period_df.groupby("category", as_index=False)["amount"]
             .sum()
             .sort_values("amount", ascending=False)
         )
 
-        if sub_df.empty:
-            st.info("No subcategory data")
-        else:
-            sub_df["percent"] = (
-                sub_df["amount"] / sub_df["amount"].sum() * 100
+        if cat_df.empty:
+            st.info("No data for selected period")
+            return
+
+        col1, col2 = st.columns(2)
+
+        # =====================
+        # CATEGORY CHART
+        # =====================
+        with col1:
+            st.subheader("By Category")
+
+            cat_df["percent"] = (
+                cat_df["amount"] / cat_df["amount"].sum() * 100
             ).round(1)
 
-            if chart_view == "Pie Chart":
-                fig_sub = px.pie(
-                    sub_df,
-                    names="subcategory",
-                    values="amount",
-                    hole=0.4
-                )
+            fig_cat = px.pie(
+                cat_df,
+                names="category",
+                values="amount",
+                hole=0.4
+            )
 
-                fig_sub.update_traces(
-                    texttemplate="%{customdata}%",
-                    customdata=sub_df["percent"],
-                    hovertemplate="<b>%{label}</b><br>₹ %{value:,.0f}<br>%{customdata}%<extra></extra>",
-                )
+            fig_cat.update_traces(
+                texttemplate="%{customdata}%",
+                customdata=cat_df["percent"],
+                hovertemplate="<b>%{label}</b><br>₹ %{value:,.0f}<br>%{customdata}%<extra></extra>"
+            )
 
-                fig_sub.update_layout(
-                    height=480,
-                    margin=dict(l=20, r=20, t=40, b=140),
-                    legend=dict(
-                        orientation="h",
-                        yanchor="top",
-                        y=-0.35,
-                        xanchor="center",
-                        x=0.5
-                    ),
-                    legend_itemclick=False,
-                    legend_itemdoubleclick=False,
-                    paper_bgcolor="#000",
-                    font=dict(color="#fff")
-                )
-                fig_sub.update_traces(marker=dict(line=dict(color="black", width=2)))
+            fig_cat.update_layout(
+                height=480,
+                margin=dict(l=20, r=20, t=40, b=140),
+                legend=dict(
+                    orientation="h",
+                    yanchor="top",
+                    y=-0.35,
+                    xanchor="center",
+                    x=0.5
+                ),
+                legend_itemclick=False,
+                legend_itemdoubleclick=False,
+                paper_bgcolor="#000",
+                font=dict(color="#fff")
+            )
+            fig_cat.update_traces(marker=dict(line=dict(color="black", width=2)))
 
-                st.plotly_chart(fig_sub, use_container_width=True)
+            st.plotly_chart(fig_cat, use_container_width=True)
 
+        # =====================
+        # SUBCATEGORY CHART
+        # =====================
+        with col2:
+            st.subheader("By Subcategory")
+
+            selected_category = st.selectbox(
+                "Select Category",
+                cat_df["category"].tolist(),
+                key="subcategory_chart_category"
+            )
+
+            sub_df = (
+                period_df[period_df["category"] == selected_category]
+                .groupby("subcategory", as_index=False)["amount"]
+                .sum()
+                .sort_values("amount", ascending=False)
+            )
+
+            if sub_df.empty:
+                st.info("No subcategory data")
             else:
-                fig_bar = px.bar(
-                    sub_df,
-                    x="subcategory",
-                    y="amount",
-                    text_auto=".2f"
-                )
+                sub_df["percent"] = (
+                    sub_df["amount"] / sub_df["amount"].sum() * 100
+                ).round(1)
 
-                fig_bar.update_layout(
-                    height=420,
-                    xaxis_title="Subcategory",
-                    yaxis_title="Amount (₹)",
-                    paper_bgcolor="#000",
-                    plot_bgcolor="#000",
-                    font=dict(color="#fff"),
-                    xaxis=dict(tickangle=-45)
-                )
-                fig_bar.update_traces(marker=dict(line=dict(color="black", width=2)))
-                fig_bar.update_traces(marker=dict(line=dict(color="black", width=2)))
-                st.plotly_chart(fig_bar, use_container_width=True)
+                if chart_view == "Pie Chart":
+                    fig_sub = px.pie(
+                        sub_df,
+                        names="subcategory",
+                        values="amount",
+                        hole=0.4
+                    )
+
+                    fig_sub.update_traces(
+                        texttemplate="%{customdata}%",
+                        customdata=sub_df["percent"],
+                        hovertemplate="<b>%{label}</b><br>₹ %{value:,.0f}<br>%{customdata}%<extra></extra>",
+                    )
+
+                    fig_sub.update_layout(
+                        height=480,
+                        margin=dict(l=20, r=20, t=40, b=140),
+                        legend=dict(
+                            orientation="h",
+                            yanchor="top",
+                            y=-0.35,
+                            xanchor="center",
+                            x=0.5
+                        ),
+                        legend_itemclick=False,
+                        legend_itemdoubleclick=False,
+                        paper_bgcolor="#000",
+                        font=dict(color="#fff")
+                    )
+                    fig_sub.update_traces(marker=dict(line=dict(color="black", width=2)))
+
+                    st.plotly_chart(fig_sub, use_container_width=True)
+
+                else:
+                    fig_bar = px.bar(
+                        sub_df,
+                        x="subcategory",
+                        y="amount",
+                        text_auto=".2f"
+                    )
+
+                    fig_bar.update_layout(
+                        height=420,
+                        xaxis_title="Subcategory",
+                        yaxis_title="Amount (₹)",
+                        paper_bgcolor="#000",
+                        plot_bgcolor="#000",
+                        font=dict(color="#fff"),
+                        xaxis=dict(tickangle=-45)
+                    )
+                    fig_bar.update_traces(marker=dict(line=dict(color="black", width=2)))
+                    fig_bar.update_traces(marker=dict(line=dict(color="black", width=2)))
+                    st.plotly_chart(fig_bar, use_container_width=True)
                 
-    # ============================
-    # BAR → TRANSACTION TABLE
-    # ============================
+        # ============================
+        # BAR → TRANSACTION TABLE
+        # ============================
     if chart_view == "Bar Chart" and not sub_df.empty:
         st.divider()
         st.subheader("📋 Transactions for Subcategory")
@@ -2117,7 +2260,7 @@ def dashboard():
         table_df = period_df[
             (period_df["category"] == selected_category) &
             (period_df["subcategory"] == selected_sub)
-        ][["date", "subcategory", "amount"]].sort_values("date")
+        ][["date", "subcategory", "amount"]].sort_values("date", ascending=False)
 
         if table_df.empty:
             st.info("No transactions found")
@@ -2138,9 +2281,215 @@ def dashboard():
                 "Total",
                 f"₹ {table_df['Amount (₹)'].sum():,.2f}"
             )
-    st.divider()
-    advanced_analytics(period_df)
 
+    # ============================
+    # ✨ ADVANCED VISUAL CHARTS
+    # ============================
+    with st.expander("✨ Advanced Visual Charts", expanded=False):
+        st.caption("High-impact chart variants with smart filters for deeper insights.")
+
+        if period_df.empty:
+            st.info("No data for advanced charts.")
+        else:
+            adv_df = period_df.copy()
+
+            f1, f2, f3 = st.columns(3)
+            all_cats = sorted(adv_df["category"].dropna().unique().tolist())
+            sel_cats = f1.multiselect(
+                "Categories",
+                all_cats,
+                default=all_cats,
+                key="advv_cats"
+            )
+            if sel_cats:
+                adv_df = adv_df[adv_df["category"].isin(sel_cats)]
+
+            all_subs = sorted(adv_df["subcategory"].dropna().unique().tolist())
+            sel_subs = f2.multiselect(
+                "Subcategories",
+                all_subs,
+                default=all_subs,
+                key="advv_subs"
+            )
+            if sel_subs:
+                adv_df = adv_df[adv_df["subcategory"].isin(sel_subs)]
+
+            metric_mode = f3.selectbox(
+                "Metric",
+                ["Total Spend", "Transaction Count", "Average Spend"],
+                key="advv_metric"
+            )
+
+            if adv_df.empty:
+                st.info("No data after filters.")
+            else:
+                variant = st.selectbox(
+                    "Chart Variant",
+                    [
+                        "Treemap (Category → Subcategory)",
+                        "Sunburst (Category → Subcategory)",
+                        "Calendar Heatmap (Weekday × Week of Month)",
+                        "Waterfall (Month-over-Month Change)",
+                        "Distribution (Box Plot by Category)"
+                    ],
+                    key="advv_variant"
+                )
+
+                def agg_metric(df, group_cols):
+                    if metric_mode == "Transaction Count":
+                        return df.groupby(group_cols).size().reset_index(name="value")
+                    if metric_mode == "Average Spend":
+                        return df.groupby(group_cols)["amount"].mean().reset_index(name="value")
+                    return df.groupby(group_cols)["amount"].sum().reset_index(name="value")
+
+                if variant == "Treemap (Category → Subcategory)":
+                    agg = agg_metric(adv_df, ["category", "subcategory"])
+                    if agg.empty:
+                        st.info("No data for treemap.")
+                    else:
+                        max_items = len(agg)
+                        if max_items > 1:
+                            top_n = st.slider(
+                                "Limit items",
+                                min_value=1,
+                                max_value=min(30, max_items),
+                                value=min(15, max_items),
+                                step=1,
+                                key="advv_treemap_top"
+                            )
+                            agg = agg.sort_values("value", ascending=False).head(top_n)
+
+                        fig = px.treemap(
+                            agg,
+                            path=["category", "subcategory"],
+                            values="value",
+                            color="value",
+                            color_continuous_scale="Viridis"
+                        )
+                        fig.update_layout(
+                            paper_bgcolor="#000",
+                            font=dict(color="#fff"),
+                            margin=dict(l=10, r=10, t=40, b=10)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                elif variant == "Sunburst (Category → Subcategory)":
+                    agg = agg_metric(adv_df, ["category", "subcategory"])
+                    if agg.empty:
+                        st.info("No data for sunburst.")
+                    else:
+                        max_items = len(agg)
+                        if max_items > 1:
+                            top_n = st.slider(
+                                "Limit items",
+                                min_value=1,
+                                max_value=min(30, max_items),
+                                value=min(15, max_items),
+                                step=1,
+                                key="advv_sunburst_top"
+                            )
+                            agg = agg.sort_values("value", ascending=False).head(top_n)
+
+                        fig = px.sunburst(
+                            agg,
+                            path=["category", "subcategory"],
+                            values="value",
+                            color="value",
+                            color_continuous_scale="Plasma"
+                        )
+                        fig.update_layout(
+                            paper_bgcolor="#000",
+                            font=dict(color="#fff"),
+                            margin=dict(l=10, r=10, t=40, b=10)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                elif variant == "Calendar Heatmap (Weekday × Week of Month)":
+                    if metric_mode == "Transaction Count":
+                        daily = adv_df.groupby("date").size().reset_index(name="value")
+                    elif metric_mode == "Average Spend":
+                        daily = adv_df.groupby("date")["amount"].mean().reset_index(name="value")
+                    else:
+                        daily = adv_df.groupby("date")["amount"].sum().reset_index(name="value")
+
+                    if daily.empty:
+                        st.info("No daily data for heatmap.")
+                    else:
+                        daily["weekday"] = daily["date"].dt.day_name().str[:3]
+                        daily["week_of_month"] = ((daily["date"].dt.day - 1) // 7) + 1
+                        weekday_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                        pivot = daily.pivot_table(
+                            index="weekday",
+                            columns="week_of_month",
+                            values="value",
+                            aggfunc="sum"
+                        ).reindex(weekday_order)
+
+                        fig = px.imshow(
+                            pivot,
+                            color_continuous_scale="Inferno",
+                            labels=dict(color="Value", x="Week of Month", y="Weekday")
+                        )
+                        fig.update_layout(
+                            paper_bgcolor="#000",
+                            plot_bgcolor="#000",
+                            font=dict(color="#fff"),
+                            margin=dict(l=30, r=30, t=40, b=30)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                elif variant == "Waterfall (Month-over-Month Change)":
+                    monthly = agg_metric(
+                        adv_df.assign(
+                            period=adv_df["date"].dt.to_period("M").dt.to_timestamp()
+                        ),
+                        ["period"]
+                    ).sort_values("period")
+
+                    if monthly.empty or len(monthly) < 2:
+                        st.info("Need at least 2 months of data for waterfall.")
+                    else:
+                        monthly["delta"] = monthly["value"].diff().fillna(monthly["value"])
+                        fig = go.Figure(go.Waterfall(
+                            x=monthly["period"].dt.strftime("%b %Y"),
+                            y=monthly["delta"],
+                            measure=["relative"] * len(monthly),
+                            increasing={"marker": {"color": "#2ecc71"}},
+                            decreasing={"marker": {"color": "#e74c3c"}},
+                            connector={"line": {"color": "#555"}}
+                        ))
+                        fig.update_layout(
+                            paper_bgcolor="#000",
+                            plot_bgcolor="#000",
+                            font=dict(color="#fff"),
+                            xaxis_title="Month",
+                            yaxis_title="Change",
+                            margin=dict(l=20, r=20, t=40, b=40)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                else:  # Distribution (Box Plot by Category)
+                    if adv_df.empty:
+                        st.info("No data for distribution.")
+                    else:
+                        fig = px.box(
+                            adv_df,
+                            x="category",
+                            y="amount",
+                            points="outliers"
+                        )
+                        fig.update_layout(
+                            paper_bgcolor="#000",
+                            plot_bgcolor="#000",
+                            font=dict(color="#fff"),
+                            xaxis_title="Category",
+                            yaxis_title="Amount (₹)",
+                            margin=dict(l=20, r=20, t=40, b=40)
+                        )
+                        fig.update_traces(marker=dict(color="#4da3ff"))
+                        st.plotly_chart(fig, use_container_width=True)
+
+    advanced_analytics(period_df)
     # ============================
     # SUBCATEGORY DETAILS TABLE
     # ============================
@@ -2148,9 +2497,20 @@ def dashboard():
 
         st.subheader("📋 Subcategory Details")
 
-        # ---- Select subcategory (based on selected category)
+        # ---- Select category + subcategory (local to this section)
+        available_categories = sorted(period_df["category"].dropna().unique())
+        if not available_categories:
+            st.info("No categories available")
+            return
+
+        table_category = st.selectbox(
+            "Select Category",
+            available_categories,
+            key="subcategory_table_category"
+        )
+
         available_subs = sorted(
-            period_df[period_df["category"] == selected_category]["subcategory"].unique()
+            period_df[period_df["category"] == table_category]["subcategory"].unique()
         )
 
         if not available_subs:
@@ -2210,7 +2570,7 @@ def dashboard():
 
         # ---- Filter data
         table_df = df[
-            (df["category"] == selected_category) &
+            (df["category"] == table_category) &
             (df["subcategory"] == selected_subcategory) &
             (df["date"].between(start_ts, end_ts))
         ][["date", "subcategory", "amount"]]
@@ -2218,7 +2578,7 @@ def dashboard():
         if table_df.empty:
             st.warning("No records found for this selection")
         else:
-            table_df = table_df.sort_values("date")
+            table_df = table_df.sort_values("date", ascending=False)
 
             # Rename columns
             table_df = table_df.rename(columns={
@@ -2400,10 +2760,125 @@ def insights():
                 """
             )
 
-# ================
-# PDF EXPORT FUNCTION
-# ================
+    # ============================
+    # 🧠 SPENDING ANOMALY DETECTOR
+    # ============================
+    st.divider()
+    st.subheader("🧠 Spending Anomaly Detector")
+    st.caption("Highlights unusual spikes or dips using a rolling median and MAD (robust z-score).")
+
+    g1, g2, g3 = st.columns(3)
+    granularity = g1.selectbox(
+        "Granularity",
+        ["Daily", "Weekly", "Monthly"],
+        key="insights_anomaly_granularity"
+    )
+    window = g2.slider(
+        "Rolling window",
+        min_value=4,
+        max_value=60,
+        value=14,
+        step=1,
+        key="insights_anomaly_window"
+    )
+    threshold = g3.slider(
+        "Sensitivity (z-score)",
+        min_value=2.5,
+        max_value=6.0,
+        value=3.5,
+        step=0.5,
+        key="insights_anomaly_threshold"
+    )
+
+    if granularity == "Weekly":
+        series = (
+            df.groupby(df["date"].dt.to_period("W"))["amount"]
+            .sum()
+            .sort_index()
+        )
+        series.index = series.index.to_timestamp()
+    elif granularity == "Monthly":
+        series = (
+            df.groupby(df["date"].dt.to_period("M"))["amount"]
+            .sum()
+            .sort_index()
+        )
+        series.index = series.index.to_timestamp()
+    else:
+        series = (
+            df.groupby(df["date"])["amount"]
+            .sum()
+            .sort_index()
+        )
+
+    if len(series) < 4:
+        st.info("Not enough data to detect anomalies.")
+    else:
+        min_periods = max(3, window // 2)
+        roll_med = series.rolling(window, center=True, min_periods=min_periods).median()
+        abs_dev = (series - roll_med).abs()
+        mad = abs_dev.rolling(window, center=True, min_periods=min_periods).median()
+
+        safe_mad = mad.replace(0, pd.NA)
+        z = 0.6745 * (series - roll_med) / safe_mad
+        z = z.fillna(0)
+        anomalies = z.abs() > threshold
+
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Anomalies Found", f"{int(anomalies.sum())}")
+        a2.metric("Max Spike", f"₹ {series.max():,.0f}")
+        a3.metric("Max Dip", f"₹ {series.min():,.0f}")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=series.index,
+            y=series.values,
+            mode="lines",
+            name="Spend",
+            line=dict(color="#4da3ff", width=2)
+        ))
+        fig.add_trace(go.Scatter(
+            x=roll_med.index,
+            y=roll_med.values,
+            mode="lines",
+            name="Rolling Median",
+            line=dict(color="#aaaaaa", width=1, dash="dot")
+        ))
+
+        if anomalies.any():
+            fig.add_trace(go.Scatter(
+                x=series.index[anomalies],
+                y=series[anomalies],
+                mode="markers",
+                name="Anomalies",
+                marker=dict(color="#ff5c5c", size=9, line=dict(color="black", width=1))
+            ))
+
+            top_anom = (
+                series[anomalies]
+                .sort_values(ascending=False)
+                .head(5)
+                .reset_index()
+            )
+            top_anom.columns = ["Date", "Amount (₹)"]
+            st.dataframe(top_anom, use_container_width=True, hide_index=True)
+
+        fig.update_layout(
+            paper_bgcolor="#000",
+            plot_bgcolor="#000",
+            font=dict(color="#fff"),
+            xaxis_title="Date",
+            yaxis_title="Amount (₹)",
+            margin=dict(l=20, r=20, t=40, b=40),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ============================
+# EXPENSE PDF EXPORT SECTION
+# ===========================
 def export_pdf(df, footer_text=""):
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -2427,7 +2902,8 @@ def export_pdf(df, footer_text=""):
 
 
     if total_amount is not None:
-        data.append(["", "", "TOTAL", f"{total_amount:.2f}"])
+        row = [""] * (len(df.columns) - 2) + ["TOTAL", f"{total_amount:.2f}"]
+        data.append(row)
 
     table = Table(data, repeatRows=1, hAlign="CENTER")
     table.setStyle(TableStyle([
@@ -2441,6 +2917,19 @@ def export_pdf(df, footer_text=""):
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
+
+    from reportlab.lib.styles import getSampleStyleSheet
+
+    styles = getSampleStyleSheet()
+
+    title_style = styles["Title"]
+    title_style.textColor = colors.white
+    title_style.alignment = 1  # CENTER
+
+    meta_style = styles["Normal"]
+    meta_style.textColor = colors.white
+    meta_style.leading = 14
+
     # Footer function
     def draw_footer(canvas, doc):
         canvas.saveState()
@@ -2465,16 +2954,47 @@ def export_pdf(df, footer_text=""):
 
         canvas.restoreState()
 
+    def header_block(text):
+        return Table(
+            [[Paragraph(text.replace(" | ", "<br/>"), meta_style)]],
+            colWidths=[doc.width],
+            style=[
+                ("BACKGROUND", (0, 0), (-1, -1), colors.black),
+                ("LEFTPADDING", (0, 0), (-1, -1), 16),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 16),
+                ("TOPPADDING", (0, 0), (-1, -1), 14),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+            ]
+        )
+
+    story = []
+
+    story.append(Paragraph("EXPENSES REPORT", title_style))
+    story.append(header_block(footer_text))
+    story.append(Spacer(1, 16))
+
+    # separator line
+    story.append(Table(
+        [[""]],
+        colWidths=[doc.width],
+        style=[
+            ("LINEBELOW", (0, 0), (-1, -1), 1, colors.white),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]
+    ))
+
+    story.append(table)
+
     doc.build(
-        [table],
+        story,
         onFirstPage=lambda c, d: (black_page(c, d), draw_footer(c, d)),
         onLaterPages=lambda c, d: (black_page(c, d), draw_footer(c, d))
     )
+
     buffer.seek(0)
     return buffer   
-# ================
-# EXPORT DATA
-# ================
+
 def export_data():
     st.title("📤 Export")
     with SessionLocal() as db:
@@ -2560,21 +3080,28 @@ def export_data():
                         pd.to_datetime(end).date()
                     )
                 )
+                .order_by(Expense.date.desc(), Expense.id.desc())
             )
             if sel_cat != "All":
                 q = q.filter(Category.name == sel_cat)
             if sel_sub != "All":
                 q = q.filter(SubCategory.name == sel_sub)
             df = pd.DataFrame(q.all())
+            if "Date" in df.columns:
+                df = df.sort_values("Date", ascending=False)
             if df.empty:
                 st.info("No data for selected filters")
             else:
+                df = df.sort_values("Date", ascending=False)
+                top_row = df.groupby("Subcategory")["Amount"].sum().idxmax()
+                top_amt = df.groupby("Subcategory")["Amount"].sum().max()
                 st.dataframe(df, use_container_width=True)
                 footer_text = (
                     f"Exported on: {today.strftime('%Y-%m-%d')} | "
                     f"Period: {period} | "
                     f"Category: {sel_cat} | "
                     f"Subcategory: {sel_sub} | "
+                    f"Top Spend: {top_row} (₹ {top_amt:,.0f}) | "
                     f"Range: {start} → {end}"
                 )
                 pdf_buf = export_pdf(df, footer_text)
@@ -2589,7 +3116,7 @@ def export_data():
                     st.download_button(
                         "⬇ PDF",
                         data=pdf_buf,
-                        file_name=f"expenses_{today.strftime('%Y-%m-%d')}.pdf",
+                        file_name=f"expenses_{period}_{start}_{end}.pdf",
                         mime="application/pdf"
                     )
         else:
@@ -2692,6 +3219,10 @@ def export_data():
                     .groupby("Category", as_index=False)["Total Amount"]
                     .sum()
                 )
+                total = cat_total_df["Total Amount"].sum()
+                cat_total_df["Share %"] = (
+                    cat_total_df["Total Amount"] / total * 100
+                ).round(1)
 
                 # --- ADD TOTAL ROW (FOR CSV + PDF)
                 total_value = cat_total_df["Total Amount"].sum()
@@ -2962,6 +3493,9 @@ def assets_page():
                 ).all(),
                 columns=["id", "Metal", "Weight (g)", "Date"]
             )
+            if not df.empty:
+                df["Date"] = pd.to_datetime(df["Date"])
+                df = df.sort_values(["Date", "id"], ascending=[False, False]).reset_index(drop=True)
 
             if not df.empty:
                 edited = st.data_editor(df, disabled=["id"])
@@ -3017,6 +3551,8 @@ def assets_page():
                 ).all(),
                 columns=["id", "Place", "Sqft"]
             )
+            if not land_tbl.empty:
+                land_tbl = land_tbl.sort_values("id", ascending=False).reset_index(drop=True)
 
             if not land_tbl.empty:
                 edited = st.data_editor(land_tbl, disabled=["id"])
@@ -3124,6 +3660,11 @@ def assets_page():
                         fd.principal, fd.rate, fd.deposit_date
                     )
                 } for fd in active_fds])
+                active_df["Deposit Date"] = pd.to_datetime(active_df["Deposit Date"])
+                active_df = active_df.sort_values(
+                    ["Deposit Date", "id"],
+                    ascending=[False, False]
+                ).reset_index(drop=True)
 
                 edited_df = st.data_editor(
                     active_df,
@@ -3199,6 +3740,11 @@ def assets_page():
                         fd.principal, fd.rate, fd.tenure_months
                     )
                 } for fd in matured_fds])
+                matured_df["Maturity Date"] = pd.to_datetime(matured_df["Maturity Date"])
+                matured_df = matured_df.sort_values(
+                    ["Maturity Date", "id"],
+                    ascending=[False, False]
+                ).reset_index(drop=True)
 
                 st.dataframe(matured_df, use_container_width=True)
 
@@ -3322,6 +3868,7 @@ def assets_page():
                 lic_df = pd.DataFrame()
 
             if not lic_df.empty:
+                lic_df = lic_df.sort_values("id", ascending=False).reset_index(drop=True)
                 edited = st.data_editor(
                     lic_df,
                     disabled=["id"],
@@ -3777,7 +4324,7 @@ def appliances_page():
     appliances = (
         db.query(Appliance)
         .options(joinedload(Appliance.images))
-        .order_by(Appliance.purchase_date.desc())
+        .order_by(Appliance.purchase_date.desc(), Appliance.id.desc())
         .all()
     )
     db.close()
@@ -4098,7 +4645,7 @@ def appliances_page():
                     appliances = (
                         db.query(Appliance)
                         .options(joinedload(Appliance.images))
-                        .order_by(Appliance.purchase_date.desc())
+                        .order_by(Appliance.purchase_date.desc(), Appliance.id.desc())
                         .all()
                     )
                     db.close()
@@ -4191,17 +4738,17 @@ page = st.sidebar.radio(
 # ======================
 # PAGE ROUTING
 # ======================
-if "page_loaded" not in st.session_state:
-    st.session_state.page_loaded = False
-# If the page is loaded for the first time, set the flag
-st.session_state.page_loaded = True
+
 PAGE_ORDER = {
-    "Expenses": 0,
-    "Dashboard": 1,
-    "Income": 2,
-    "Assets": 3,
-    "Reports": 4
+    "📊 Expense Dashboard": 0,
+    "➕ Add Expense": 1,
+    "📤 Export Expenses": 2,
+    "🔌 Appliances Data": 3,
+    "💰 Income": 4,
+    "🏦 Assets": 5,
+    "📈 Insights": 6
 }
+
 current_page = page                                                # whatever variable you use
 prev_page = st.session_state.get("prev_page", current_page)        # get previous page from session state
 direction = "right"                                                # default direction
@@ -4249,4 +4796,3 @@ elif page == "🔌 Appliances Data":
     appliances_page()
 elif page == "📤 Export Expenses":
     export_data()
-
