@@ -29,10 +29,14 @@ from reportlab.lib.styles import getSampleStyleSheet
 import requests
 import matplotlib.pyplot as plt
 from dateutil.relativedelta import relativedelta
+import calendar
 import os
 import platform
 import time
 import subprocess
+import shutil
+import smtplib
+from email.message import EmailMessage
 
 
 
@@ -56,6 +60,7 @@ if "show_inv_delete_manager" not in st.session_state:
 # ==============
 # FLASH MESSAGE
 # ==============
+# Handle flash.
 def flash(message, kind="success"):
     st.session_state.setdefault("flash_msgs", [])
     st.session_state.flash_msgs.append({
@@ -96,6 +101,7 @@ SessionLocal = sessionmaker(
 )
 
 
+# Get DB.
 def get_db():
     return SessionLocal()
 
@@ -235,10 +241,685 @@ class InvestmentEntry(Base):
 Base.metadata.create_all(bind=engine)
 
 # ==============
+# WEEKLY GDRIVE BACKUP (SUNDAYS)
+# ==============
+GDRIVE_BACKUP_DIR = "/run/user/1000/gvfs/google-drive:host=gmail.com,user=bharanikumarr18/0AD1AeGLeY7L2Uk9PVA/1N9g1kGDrxiZpVq73wtodNM_ithFp5sl1"
+BACKUP_FILENAME = "expense_backup.db"
+BACKUP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_gdrive_backup.txt")
+
+# Handle weekly Google Drive backup.
+def weekly_gdrive_backup():
+    if st.session_state.get("weekly_backup_checked"):
+        return
+    st.session_state.weekly_backup_checked = True
+
+    today = date.today()
+    if today.weekday() != 6:  # Sunday
+        return
+
+    try:
+        if os.path.exists(BACKUP_STATE_FILE):
+            last = open(BACKUP_STATE_FILE, "r").read().strip()
+            if last == today.isoformat():
+                return
+    except Exception:
+        pass
+
+    if not os.path.isdir(GDRIVE_BACKUP_DIR):
+        if not st.session_state.get("weekly_backup_warned"):
+            st.session_state.weekly_backup_warned = True
+            st.warning("Weekly backup skipped: Google Drive folder not available.")
+        return
+
+    db_path = "expense.db"
+    if DATABASE_URL.startswith("sqlite:///"):
+        db_path = DATABASE_URL.replace("sqlite:///", "")
+    elif DATABASE_URL.startswith("sqlite:////"):
+        db_path = DATABASE_URL.replace("sqlite:////", "/")
+
+    if not os.path.isabs(db_path):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.abspath(os.path.join(base_dir, db_path))
+
+    if not os.path.exists(db_path):
+        if not st.session_state.get("weekly_backup_warned"):
+            st.session_state.weekly_backup_warned = True
+            st.warning("Weekly backup skipped: expense.db not found.")
+        return
+
+    dest = os.path.join(GDRIVE_BACKUP_DIR, BACKUP_FILENAME)
+    shutil.copy2(db_path, dest)
+    with open(BACKUP_STATE_FILE, "w") as f:
+        f.write(today.isoformat())
+    flash("Weekly backup saved to Google Drive.", "info")
+
+weekly_gdrive_backup()
+
+# ==============
+# WEEKLY EMAIL REPORT (SUNDAYS)
+# ==============
+SMTP_HOST = st.secrets.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(st.secrets.get("SMTP_PORT", 587))
+SMTP_USER = st.secrets.get("SMTP_USER", "")
+SMTP_PASS = st.secrets.get("SMTP_PASS", "")
+SMTP_TO = st.secrets.get("SMTP_TO", "bharanikumarr18@gmail.com")
+WEEKLY_EMAIL_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".last_weekly_email.txt"
+)
+MONTHLY_EMAIL_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".last_monthly_email.txt"
+)
+
+# Generate weekly expense PDF.
+def generate_weekly_expense_pdf(start_date, end_date):
+    with SessionLocal() as db:
+        rows = (
+            db.query(
+                Expense.date,
+                Category.name.label("category"),
+                SubCategory.name.label("subcategory"),
+                Expense.amount
+            )
+            .join(Category, Expense.category_id == Category.id)
+            .join(SubCategory, Expense.subcategory_id == SubCategory.id)
+            .filter(Expense.date.between(start_date, end_date))
+            .order_by(Expense.date.desc(), Expense.id.desc())
+            .all()
+        )
+
+    df = pd.DataFrame(rows, columns=["date", "category", "subcategory", "amount"])
+    total = float(df["amount"].sum()) if not df.empty else 0.0
+    count = int(len(df))
+    avg = (total / count) if count else 0.0
+
+    cat_summary = (
+        df.groupby("category")["amount"].sum()
+        .sort_values(ascending=False)
+    ) if not df.empty else pd.Series(dtype=float)
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="TitleBig",
+        fontName="DejaVu",
+        fontSize=18,
+        leading=22,
+        spaceAfter=10
+    ))
+    styles.add(ParagraphStyle(
+        name="SectionHeader",
+        fontName="DejaVu",
+        fontSize=12,
+        leading=16,
+        spaceBefore=10,
+        spaceAfter=6
+    ))
+    styles.add(ParagraphStyle(
+        name="BodySmall",
+        fontName="DejaVu",
+        fontSize=9,
+        leading=12
+    ))
+    table_header = ParagraphStyle(
+        name="TableHeader",
+        fontName="DejaVu",
+        fontSize=9,
+        leading=11
+    )
+    table_body = ParagraphStyle(
+        name="TableBody",
+        fontName="DejaVu",
+        fontSize=8,
+        leading=10,
+        wordWrap="CJK"
+    )
+
+    story = []
+    story.append(Paragraph("Weekly Expense Report", styles["TitleBig"]))
+    story.append(Paragraph(
+        f"Period: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}",
+        styles["BodySmall"]
+    ))
+    story.append(Paragraph(
+        f"Generated: {date.today().strftime('%d %b %Y')}",
+        styles["BodySmall"]
+    ))
+    story.append(Spacer(1, 10))
+
+    # Summary block
+    story.append(Paragraph("Summary", styles["SectionHeader"]))
+    summary_data = [
+        ["Total Expense (₹)", f"{total:,.2f}"],
+        ["Transactions", f"{count}"],
+        ["Average per Transaction (₹)", f"{avg:,.2f}"],
+    ]
+    summary_table = Table(summary_data, colWidths=[300, 110], hAlign="LEFT")
+    summary_table.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "DejaVu"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 10))
+
+    # Category breakdown
+    story.append(Paragraph("Category Breakdown", styles["SectionHeader"]))
+    if cat_summary.empty:
+        story.append(Paragraph("No expenses recorded in this period.", styles["BodySmall"]))
+    else:
+        cat_rows = [[
+            Paragraph("Category", table_header),
+            Paragraph("Total (₹)", table_header)
+        ]]
+        for cat, amt in cat_summary.items():
+            cat_rows.append([
+                Paragraph(str(cat), table_body),
+                Paragraph(f"{amt:,.2f}", table_body)
+            ])
+        cat_table = Table(cat_rows, colWidths=[320, 110], hAlign="LEFT", repeatRows=1)
+        cat_table.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, -1), "DejaVu"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(cat_table)
+    story.append(Spacer(1, 12))
+
+    # Detailed transactions
+    story.append(Paragraph("Transactions", styles["SectionHeader"]))
+    if df.empty:
+        story.append(Paragraph("No transactions found for this week.", styles["BodySmall"]))
+    else:
+        tx_rows = [[
+            Paragraph("Date", table_header),
+            Paragraph("Category", table_header),
+            Paragraph("Subcategory", table_header),
+            Paragraph("Amount (₹)", table_header)
+        ]]
+        for _, row in df.iterrows():
+            tx_rows.append([
+                Paragraph(row["date"].strftime("%Y-%m-%d"), table_body),
+                Paragraph(str(row["category"]), table_body),
+                Paragraph(str(row["subcategory"]), table_body),
+                Paragraph(f"{row['amount']:,.2f}", table_body)
+            ])
+        tx_table = Table(
+            tx_rows,
+            colWidths=[70, 160, 190, 80],
+            hAlign="LEFT",
+            repeatRows=1
+        )
+        tx_table.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, -1), "DejaVu"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("ALIGN", (3, 1), (3, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(tx_table)
+
+    doc.build(story)
+    return buffer.getvalue()
+
+# Generate monthly expense PDF.
+def generate_monthly_expense_pdf(start_date, end_date):
+    with SessionLocal() as db:
+        rows = (
+            db.query(
+                Expense.date,
+                Category.name.label("category"),
+                SubCategory.name.label("subcategory"),
+                Expense.amount
+            )
+            .join(Category, Expense.category_id == Category.id)
+            .join(SubCategory, Expense.subcategory_id == SubCategory.id)
+            .filter(Expense.date.between(start_date, end_date))
+            .order_by(Expense.date.desc(), Expense.id.desc())
+            .all()
+        )
+
+    df = pd.DataFrame(rows, columns=["date", "category", "subcategory", "amount"])
+
+    total = float(df["amount"].sum()) if not df.empty else 0.0
+    count = int(len(df))
+    avg = (total / count) if count else 0.0
+
+    cat_summary = (
+        df.groupby("category")["amount"].sum()
+        .sort_values(ascending=False)
+    ) if not df.empty else pd.Series(dtype=float)
+
+    subcat_summary = (
+        df.groupby("subcategory")["amount"].sum()
+        .sort_values(ascending=False)
+    ) if not df.empty else pd.Series(dtype=float)
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="TitleBig",
+        fontName="DejaVu",
+        fontSize=18,
+        leading=22,
+        spaceAfter=10
+    ))
+    styles.add(ParagraphStyle(
+        name="SectionHeader",
+        fontName="DejaVu",
+        fontSize=12,
+        leading=16,
+        spaceBefore=10,
+        spaceAfter=6
+    ))
+    styles.add(ParagraphStyle(
+        name="BodySmall",
+        fontName="DejaVu",
+        fontSize=9,
+        leading=12
+    ))
+    table_header = ParagraphStyle(
+        name="TableHeader",
+        fontName="DejaVu",
+        fontSize=9,
+        leading=11
+    )
+    table_body = ParagraphStyle(
+        name="TableBody",
+        fontName="DejaVu",
+        fontSize=8,
+        leading=10,
+        wordWrap="CJK"
+    )
+
+    story = []
+    story.append(Paragraph("Monthly Expense Report", styles["TitleBig"]))
+    story.append(Paragraph(
+        f"Period: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}",
+        styles["BodySmall"]
+    ))
+    story.append(Paragraph(
+        f"Generated: {date.today().strftime('%d %b %Y')}",
+        styles["BodySmall"]
+    ))
+    story.append(Spacer(1, 10))
+
+    # Summary block
+    story.append(Paragraph("Summary", styles["SectionHeader"]))
+    summary_data = [
+        ["Total Expense (₹)", f"{total:,.2f}"],
+        ["Transactions", f"{count}"],
+        ["Average per Transaction (₹)", f"{avg:,.2f}"],
+    ]
+    summary_table = Table(summary_data, colWidths=[300, 110], hAlign="LEFT")
+    summary_table.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "DejaVu"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 10))
+
+    # Category totals
+    story.append(Paragraph("Category Totals", styles["SectionHeader"]))
+    if cat_summary.empty:
+        story.append(Paragraph("No expenses recorded in this period.", styles["BodySmall"]))
+    else:
+        cat_rows = [[
+            Paragraph("Category", table_header),
+            Paragraph("Total (₹)", table_header)
+        ]]
+        for cat, amt in cat_summary.items():
+            cat_rows.append([
+                Paragraph(str(cat), table_body),
+                Paragraph(f"{amt:,.2f}", table_body)
+            ])
+        cat_table = Table(cat_rows, colWidths=[320, 110], hAlign="LEFT", repeatRows=1)
+        cat_table.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, -1), "DejaVu"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(cat_table)
+    story.append(Spacer(1, 10))
+
+    # Subcategory totals
+    story.append(Paragraph("Subcategory Totals", styles["SectionHeader"]))
+    if subcat_summary.empty:
+        story.append(Paragraph("No subcategory data for this period.", styles["BodySmall"]))
+    else:
+        subcat_rows = [[
+            Paragraph("Subcategory", table_header),
+            Paragraph("Total (₹)", table_header)
+        ]]
+        for subcat, amt in subcat_summary.items():
+            subcat_rows.append([
+                Paragraph(str(subcat), table_body),
+                Paragraph(f"{amt:,.2f}", table_body)
+            ])
+        subcat_table = Table(
+            subcat_rows,
+            colWidths=[320, 110],
+            hAlign="LEFT",
+            repeatRows=1
+        )
+        subcat_table.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, -1), "DejaVu"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(subcat_table)
+    story.append(Spacer(1, 12))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+# Send weekly email report.
+def send_weekly_email_report():
+    if st.session_state.get("weekly_email_checked"):
+        return
+    st.session_state.weekly_email_checked = True
+
+    today = date.today()
+    if today.weekday() != 6:  # Sunday
+        return
+
+    try:
+        if os.path.exists(WEEKLY_EMAIL_STATE_FILE):
+            last = open(WEEKLY_EMAIL_STATE_FILE, "r").read().strip()
+            if last == today.isoformat():
+                return
+    except Exception:
+        pass
+
+    if not SMTP_USER or not SMTP_PASS or not SMTP_TO:
+        if not st.session_state.get("weekly_email_warned"):
+            st.session_state.weekly_email_warned = True
+            st.warning("Weekly email skipped: SMTP credentials not configured.")
+        return
+
+    end_date = today - timedelta(days=1)  # Saturday
+    start_date = end_date - timedelta(days=6)  # Sunday
+
+    pdf_bytes = generate_weekly_expense_pdf(start_date, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Weekly Expense Report ({start_date} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = SMTP_TO
+    msg.set_content(
+        "Hello,\n\n"
+        "Attached is your weekly expense report.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_{start_date}_{end_date}.pdf"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        with open(WEEKLY_EMAIL_STATE_FILE, "w") as f:
+            f.write(today.isoformat())
+        flash("Weekly email report sent.", "info")
+    except Exception as e:
+        st.warning(f"Weekly email failed: {e}")
+
+# Send test email report.
+def send_test_email_report():
+    if not SMTP_USER or not SMTP_PASS or not SMTP_TO:
+        st.warning("SMTP credentials not configured. Add them in secrets.toml first.")
+        return
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=6)
+    pdf_bytes = generate_weekly_expense_pdf(start_date, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Test Expense Report ({start_date} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = SMTP_TO
+    msg.set_content(
+        "Hello,\n\n"
+        "This is a test email from your Expense Tracker.\n"
+        "Attached is a sample report for the last 7 days.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_test_{start_date}_{end_date}.pdf"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        st.success("Test email sent successfully.")
+    except Exception as e:
+        st.error(f"Test email failed: {e}")
+
+# Send monthly email report.
+def send_monthly_email_report():
+    if st.session_state.get("monthly_email_checked"):
+        return
+    st.session_state.monthly_email_checked = True
+
+    today = date.today()
+    if today.day != 3:
+        return
+
+    try:
+        if os.path.exists(MONTHLY_EMAIL_STATE_FILE):
+            last = open(MONTHLY_EMAIL_STATE_FILE, "r").read().strip()
+            if last == today.isoformat():
+                return
+    except Exception:
+        pass
+
+    if not SMTP_USER or not SMTP_PASS or not SMTP_TO:
+        if not st.session_state.get("monthly_email_warned"):
+            st.session_state.monthly_email_warned = True
+            st.warning("Monthly email skipped: SMTP credentials not configured.")
+        return
+
+    current_month_start = date(today.year, today.month, 1)
+    end_date = current_month_start - timedelta(days=1)
+    start_date = date(end_date.year, end_date.month, 1)
+
+    pdf_bytes = generate_monthly_expense_pdf(start_date, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Monthly Expense Report ({start_date} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = SMTP_TO
+    msg.set_content(
+        "Hello,\n\n"
+        "Attached is your monthly expense report.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_{start_date}_{end_date}.pdf"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        with open(MONTHLY_EMAIL_STATE_FILE, "w") as f:
+            f.write(today.isoformat())
+        flash("Monthly email report sent.", "info")
+    except Exception as e:
+        st.warning(f"Monthly email failed: {e}")
+
+# Send test monthly email report.
+def send_test_monthly_email_report():
+    if not SMTP_USER or not SMTP_PASS or not SMTP_TO:
+        st.warning("SMTP credentials not configured. Add them in secrets.toml first.")
+        return
+
+    today = date.today()
+    current_month_start = date(today.year, today.month, 1)
+    end_date = current_month_start - timedelta(days=1)
+    start_date = date(end_date.year, end_date.month, 1)
+
+    pdf_bytes = generate_monthly_expense_pdf(start_date, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Test Monthly Report ({start_date} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = SMTP_TO
+    msg.set_content(
+        "Hello,\n\n"
+        "This is a test monthly report from your Expense Tracker.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_test_{start_date}_{end_date}.pdf"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        st.success("Monthly test email sent successfully.")
+    except Exception as e:
+        st.error(f"Monthly test email failed: {e}")
+
+# Add months.
+def add_months(start_date, months):
+    total = (start_date.year * 12 + (start_date.month - 1)) + months
+    year = total // 12
+    month = (total % 12) + 1
+    return date(year, month, 1)
+
+# Get month options.
+def get_month_options(months_back=24):
+    with SessionLocal() as db:
+        rows = db.query(Expense.date).all()
+    if not rows:
+        return []
+    month_counts = {}
+    for (d,) in rows:
+        if not d:
+            continue
+        month_start = date(d.year, d.month, 1)
+        month_counts[month_start] = month_counts.get(month_start, 0) + 1
+    options = [
+        (month.strftime("%b %Y"), month)
+        for month in sorted(month_counts.keys(), reverse=True)
+        if month_counts.get(month, 0) > 0
+    ]
+    return options
+
+# Send custom monthly report.
+def send_custom_monthly_report(month_start, target_email):
+    if not SMTP_USER or not SMTP_PASS:
+        st.warning("SMTP credentials not configured. Add them in secrets.toml first.")
+        return
+    if not target_email or "@" not in target_email:
+        st.warning("Please enter a valid email address.")
+        return
+
+    end_date = add_months(month_start, 1) - timedelta(days=1)
+    pdf_bytes = generate_monthly_expense_pdf(month_start, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Monthly Expense Report ({month_start} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = target_email
+    msg.set_content(
+        "Hello,\n\n"
+        f"Attached is the monthly expense report for {month_start.strftime('%b %Y')}.\n"
+        "It includes category totals and subcategory totals.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_{month_start}_{end_date}.pdf"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        st.success("Monthly report sent successfully.")
+    except Exception as e:
+        st.error(f"Monthly report failed: {e}")
+
+send_weekly_email_report()
+send_monthly_email_report()
+
+# ==============
 # CREATE TABLES
 # ==============
 if "data_refresh" not in st.session_state:
     st.session_state.data_refresh = 0
+# Load expense data.
 @st.cache_data(show_spinner=False)
 def load_expense_data(refresh_key):
     with SessionLocal() as db:
@@ -677,10 +1358,12 @@ if "flash_msgs" in st.session_state:
 # ==============
 # HELPER FUNCTIONS
 # ==============
+# Render a small section header with caption.
 def section(title, desc):
     st.subheader(title)
     st.caption(desc)
 
+# Render cumulative spend chart.
 def cumulative_spend_chart(df):
     with st.expander("📈 Cumulative Spending Curve", expanded=False):
         st.caption(
@@ -718,6 +1401,285 @@ def cumulative_spend_chart(df):
         st.plotly_chart(fig, use_container_width=True)
     
 
+# Render a clean, aligned calendar view with filters and summary.
+def render_calendar_view(df):
+    if df.empty:
+        st.info("No data available")
+        return
+
+    cal_df = df.copy()
+    cal_df["date"] = pd.to_datetime(cal_df["date"])
+
+    st.subheader("📅 Calendar View")
+
+    cal_df["month_start"] = cal_df["date"].dt.to_period("M").dt.to_timestamp()
+    month_series = (
+        cal_df["month_start"]
+        .drop_duplicates()
+        .sort_values(ascending=False)
+    )
+    month_labels = [m.strftime("%b %Y") for m in month_series]
+    month_map = {m.strftime("%b %Y"): m for m in month_series}
+
+    c1, c2, c3, c4, c5 = st.columns([2, 2, 3, 2, 2])
+    selected_label = c1.selectbox("Month", month_labels, index=0)
+    metric_mode = c2.selectbox(
+        "Metric",
+        ["Total Spend", "Transaction Count", "Average Spend"],
+        index=0
+    )
+    selected_categories = c3.multiselect(
+        "Category Filter",
+        sorted(cal_df["category"].unique().tolist()),
+        default=[]
+    )
+    week_start = c4.selectbox("Week Starts", ["Monday", "Sunday"], index=0)
+    label_mode = c5.selectbox(
+        "Labels",
+        ["Day + Total", "Day + Total + Metric", "Total (Non-Zero)"],
+        index=0
+    )
+
+    month_start = month_map[selected_label]
+    month_end = (month_start + pd.offsets.MonthEnd(1)).normalize()
+    month_mask = (cal_df["date"] >= month_start) & (cal_df["date"] <= month_end)
+    month_df = cal_df.loc[month_mask].copy()
+    if selected_categories:
+        month_df = month_df[month_df["category"].isin(selected_categories)]
+
+    daily = (
+        month_df.groupby(month_df["date"].dt.date)["amount"]
+        .agg(total="sum", count="size")
+        .reset_index()
+    )
+    daily["avg"] = daily["total"] / daily["count"]
+    daily_map = {
+        row["date"]: {
+            "total": float(row["total"]),
+            "count": int(row["count"]),
+            "avg": float(row["avg"])
+        }
+        for _, row in daily.iterrows()
+    }
+
+    # Summary metrics
+    total_month = float(daily["total"].sum()) if not daily.empty else 0.0
+    active_days = int(daily["date"].nunique()) if not daily.empty else 0
+    avg_day = (total_month / active_days) if active_days else 0.0
+    peak_day_amt = daily["total"].max() if not daily.empty else 0.0
+    peak_day_date = daily.loc[daily["total"].idxmax(), "date"] if not daily.empty else None
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Month Total", f"₹ {total_month:,.2f}")
+    m2.metric("Avg Spend / Day", f"₹ {avg_day:,.2f}")
+    m3.metric(
+        "Peak Day",
+        f"₹ {peak_day_amt:,.2f}",
+        delta=peak_day_date.strftime("%d %b %Y") if peak_day_date else "—"
+    )
+
+    # Build calendar grid with numeric axes for perfect alignment
+    firstweekday = 0 if week_start == "Monday" else 6
+    cal = calendar.Calendar(firstweekday=firstweekday)
+    weeks = cal.monthdayscalendar(month_start.year, month_start.month)
+
+    z = []
+    hover = []
+    annotations = []
+    for r, week in enumerate(weeks):
+        row_z = []
+        row_hover = []
+        for c, day in enumerate(week):
+            if day == 0:
+                row_z.append(0)
+                row_hover.append("")
+                continue
+
+            dt = date(month_start.year, month_start.month, day)
+            stats = daily_map.get(dt, {"total": 0.0, "count": 0, "avg": 0.0})
+
+            total_label = f"₹{stats['total']:,.0f}"
+            if metric_mode == "Total Spend":
+                value = stats["total"]
+                metric_label = total_label
+            elif metric_mode == "Transaction Count":
+                value = stats["count"]
+                metric_label = f"{int(value)} tx"
+            else:
+                value = stats["avg"] if stats["count"] else 0.0
+                metric_label = f"₹{value:,.0f}"
+
+            row_z.append(value)
+            row_hover.append(
+                f"{dt.strftime('%d %b %Y')}<br>"
+                f"Total: ₹ {stats['total']:,.2f}<br>"
+                f"Transactions: {stats['count']}<br>"
+                f"Average: ₹ {stats['avg']:,.2f}"
+            )
+
+            label = f"{day}<br>{total_label}"
+            if label_mode == "Day + Total + Metric" and metric_mode != "Total Spend":
+                label = f"{day}<br>{total_label}<br>{metric_label}"
+            elif label_mode == "Total (Non-Zero)" and stats["total"] <= 0:
+                label = f"{day}"
+
+            annotations.append(
+                dict(
+                    x=c,
+                    y=r,
+                    text=label,
+                    showarrow=False,
+                    font=dict(color="#ffffff", size=12)
+                )
+            )
+        z.append(row_z)
+        hover.append(row_hover)
+
+    day_labels = (
+        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        if week_start == "Monday"
+        else ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    )
+
+    max_val = float(daily["total"].max()) if not daily.empty else 0.0
+    if metric_mode == "Transaction Count" and not daily.empty:
+        max_val = float(daily["count"].max())
+    if metric_mode == "Average Spend" and not daily.empty:
+        max_val = float(daily["avg"].max())
+    if max_val <= 0:
+        max_val = 1.0
+
+    fig_cal = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=list(range(7)),
+            y=list(range(len(weeks))),
+            hovertext=hover,
+            hoverinfo="text",
+            hoverongaps=False,
+            colorscale=[
+                [0.0, "#000000"],
+                [1.0, "#000000"],
+            ],
+            zmin=0,
+            zmax=1,
+            showscale=False
+        )
+    )
+
+    fig_cal.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(
+            tickvals=list(range(7)),
+            ticktext=day_labels,
+            side="top",
+            showgrid=False,
+            zeroline=False,
+            ticks="",
+            showline=False,
+            fixedrange=True,
+            tickfont=dict(color="#ffffff")
+        ),
+        yaxis=dict(
+            showgrid=False,
+            zeroline=False,
+            showticklabels=False,
+            ticks="",
+            showline=False,
+            autorange="reversed",
+            fixedrange=True
+        ),
+        plot_bgcolor="#000000",
+        paper_bgcolor="#000000",
+        font=dict(color="white"),
+        annotations=annotations,
+        dragmode=False
+    )
+    fig_cal.update_traces(
+        xgap=1,
+        ygap=1,
+        hoverlabel=dict(bgcolor="#0f1720", font=dict(color="#e6f2ff"))
+    )
+
+    # Improve label contrast on bright cells by adding a dark stroke
+    fig_cal.update_annotations(font=dict(color="#ffffff"))
+
+    # Premium layout: calendar + trend + top categories
+    cal_left, cal_right = st.columns([2.2, 1.3])
+    with cal_left:
+        st.plotly_chart(fig_cal, use_container_width=True)
+    with cal_right:
+        if daily.empty:
+            st.info("No activity in this month.")
+        else:
+            trend = daily.sort_values("date")
+            fig_trend = go.Figure()
+            fig_trend.add_trace(go.Scatter(
+                x=trend["date"],
+                y=trend["total"],
+                mode="lines+markers",
+                line=dict(color="#4da3ff", width=3),
+                marker=dict(size=6, color="#9ad1ff"),
+                name="Daily Spend"
+            ))
+            fig_trend.update_layout(
+                height=200,
+                margin=dict(l=10, r=10, t=10, b=10),
+                plot_bgcolor="#000000",
+                paper_bgcolor="#000000",
+                font=dict(color="white"),
+                xaxis=dict(title="", showgrid=False),
+                yaxis=dict(title="", showgrid=True, gridcolor="#1a1a1a")
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
+
+            top_cats = (
+                month_df.groupby("category")["amount"].sum()
+                .sort_values(ascending=False)
+                .head(6)
+            )
+            if not top_cats.empty:
+                fig_top = go.Figure(go.Bar(
+                    x=top_cats.values,
+                    y=top_cats.index,
+                    orientation="h",
+                    marker=dict(color="#2c6fa0")
+                ))
+                fig_top.update_layout(
+                    height=220,
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    plot_bgcolor="#000000",
+                    paper_bgcolor="#000000",
+                    font=dict(color="white"),
+                    xaxis=dict(showgrid=False),
+                    yaxis=dict(showgrid=False)
+                )
+                st.plotly_chart(fig_top, use_container_width=True)
+
+    with st.expander("Drilldown Day", expanded=False):
+        day_options = sorted(daily["date"].tolist()) if not daily.empty else []
+        if day_options:
+            selected_day = st.selectbox(
+                "Select date",
+                day_options,
+                format_func=lambda d: d.strftime("%d %b %Y")
+            )
+            day_rows = month_df[month_df["date"].dt.date == selected_day]
+            if not day_rows.empty:
+                day_rows = day_rows.sort_values("amount", ascending=False)
+                st.dataframe(
+                    day_rows[["date", "category", "subcategory", "amount"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("No transactions for this day.")
+        else:
+            st.info("No daily data available for drilldown.")
+
+
+# Handle advanced analytics.
 def advanced_analytics(period_df):
 
     if period_df.empty:
@@ -731,11 +1693,13 @@ def advanced_analytics(period_df):
     # now call charts
     cumulative_spend_chart(df)
 
+# Get price.
 def get_price(db, key, default=0.0):
     row = db.query(AssetPrice).filter(AssetPrice.key == key).first()
     return row.value if row else default
 
 
+# Set price.
 def set_price(db, key, value):
     row = db.query(AssetPrice).filter(AssetPrice.key == key).first()
     if row:
@@ -744,12 +1708,14 @@ def set_price(db, key, value):
         db.add(AssetPrice(key=key, value=value))
     db.commit()
 
+# Handle fd current value.
 def fd_current_value(principal, rate, deposit_date):
     days = (date.today() - deposit_date).days
     years = max(days, 0) / 365
     return principal * ((1 + rate / 100) ** years)
 
 
+# Handle fd maturity value.
 def fd_maturity_value(principal, rate, tenure_months):
     years = tenure_months / 12
     return principal * ((1 + rate / 100) ** years)
@@ -757,6 +1723,7 @@ def fd_maturity_value(principal, rate, tenure_months):
 APPLIANCE_IMG_DIR = "appliance_images"
 os.makedirs(APPLIANCE_IMG_DIR, exist_ok=True)
 
+# Handle open image.
 def open_image(path):
     if not os.path.exists(path):
         st.warning("Image not found")
@@ -770,12 +1737,14 @@ def open_image(path):
     else:
         subprocess.run(["xdg-open", path])
 
+# Handle black page.
 def black_page(canvas, doc):
     canvas.saveState()
     canvas.setFillColor(colors.black)
     canvas.rect(0, 0, doc.pagesize[0], doc.pagesize[1], stroke=0, fill=1)
     canvas.restoreState()
 
+# Handle is edit mode.
 def is_edit_mode(aid):
     return st.session_state.get(f"edit_mode_{aid}", False)
 
@@ -783,6 +1752,7 @@ def is_edit_mode(aid):
 # ==============
 # ADD EXPENSE
 # ==============
+# Add expense.
 def add_expense():
     st.markdown("## <span>➕</span> Add Expense", unsafe_allow_html=True)
     with SessionLocal() as db:
@@ -851,6 +1821,7 @@ def add_expense():
 # ============
 # ADD INCOME
 # ============
+# Handle income section.
 def income_section():
     with SessionLocal() as db:
         # ================
@@ -1522,6 +2493,7 @@ def income_section():
 # ====================
 # MANAGE CATEGORIES
 # ====================
+# Handle manage categories.
 def manage_categories():
     st.title("📂 Manage Categories")
     with SessionLocal() as db:
@@ -1718,6 +2690,7 @@ def manage_categories():
 # ===============
 # MANAGE ENTRIES
 # ===============
+# Handle manage entries.
 def manage_entries():
     st.title("🧾 Manage Entries")
     with SessionLocal() as db:
@@ -1901,6 +2874,7 @@ def manage_entries():
 # =================
 # EXPENSE DASHBOARD
 # =================
+# Handle dashboard.
 def dashboard():
     st.title("📊 Dashboard")
 
@@ -1923,6 +2897,11 @@ def dashboard():
         return
 
     df["date"] = pd.to_datetime(df["date"])
+
+    # ============================
+    # CALENDAR VIEW
+    # ============================
+    render_calendar_view(df)
 
     # ============================
     # COMMON DATE ANCHORS
@@ -2004,6 +2983,10 @@ def dashboard():
                 st.sidebar.write(
                     f"• **{row['subcategory']}** — ₹ {row['amount']:,.0f}"
                 )
+            st.sidebar.markdown(
+                f"<div style='font-size:16px; font-weight:700;'>Total — ₹ {grouped['amount'].sum():,.0f}</div>",
+                unsafe_allow_html=True
+            )
 
         # ========================
         # DATABASE ENTRY COUNT (LIVE)
@@ -2328,13 +3311,13 @@ def dashboard():
                     [
                         "Treemap (Category → Subcategory)",
                         "Sunburst (Category → Subcategory)",
-                        "Calendar Heatmap (Weekday × Week of Month)",
                         "Waterfall (Month-over-Month Change)",
                         "Distribution (Box Plot by Category)"
                     ],
                     key="advv_variant"
                 )
 
+                # Handle agg metric.
                 def agg_metric(df, group_cols):
                     if metric_mode == "Transaction Count":
                         return df.groupby(group_cols).size().reset_index(name="value")
@@ -2401,40 +3384,6 @@ def dashboard():
                             paper_bgcolor="#000",
                             font=dict(color="#fff"),
                             margin=dict(l=10, r=10, t=40, b=10)
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-
-                elif variant == "Calendar Heatmap (Weekday × Week of Month)":
-                    if metric_mode == "Transaction Count":
-                        daily = adv_df.groupby("date").size().reset_index(name="value")
-                    elif metric_mode == "Average Spend":
-                        daily = adv_df.groupby("date")["amount"].mean().reset_index(name="value")
-                    else:
-                        daily = adv_df.groupby("date")["amount"].sum().reset_index(name="value")
-
-                    if daily.empty:
-                        st.info("No daily data for heatmap.")
-                    else:
-                        daily["weekday"] = daily["date"].dt.day_name().str[:3]
-                        daily["week_of_month"] = ((daily["date"].dt.day - 1) // 7) + 1
-                        weekday_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-                        pivot = daily.pivot_table(
-                            index="weekday",
-                            columns="week_of_month",
-                            values="value",
-                            aggfunc="sum"
-                        ).reindex(weekday_order)
-
-                        fig = px.imshow(
-                            pivot,
-                            color_continuous_scale="Inferno",
-                            labels=dict(color="Value", x="Week of Month", y="Weekday")
-                        )
-                        fig.update_layout(
-                            paper_bgcolor="#000",
-                            plot_bgcolor="#000",
-                            font=dict(color="#fff"),
-                            margin=dict(l=30, r=30, t=40, b=30)
                         )
                         st.plotly_chart(fig, use_container_width=True)
 
@@ -2604,6 +3553,7 @@ def dashboard():
 ## ======================================
 # INSIGHTS
 # ======================================
+# Handle insights.
 def insights():
     st.title("📈 Insights")
     # ============================
@@ -2877,6 +3827,7 @@ def insights():
     # ============================
 # EXPENSE PDF EXPORT SECTION
 # ===========================
+# Export PDF.
 def export_pdf(df, footer_text=""):
     df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
     buffer = io.BytesIO()
@@ -2954,6 +3905,7 @@ def export_pdf(df, footer_text=""):
 
         canvas.restoreState()
 
+    # Handle header block.
     def header_block(text):
         return Table(
             [[Paragraph(text.replace(" | ", "<br/>"), meta_style)]],
@@ -2995,6 +3947,7 @@ def export_pdf(df, footer_text=""):
     buffer.seek(0)
     return buffer   
 
+# Export data.
 def export_data():
     st.title("📤 Export")
     with SessionLocal() as db:
@@ -3282,6 +4235,7 @@ def export_data():
 # ===========
 # ASSETS PAGE
 # ===========
+# Handle assets page.
 def assets_page():
     st.title("🏦 Assets")
 
@@ -4216,6 +5170,7 @@ def assets_page():
 
                 from reportlab.lib import colors
 
+                # Handle black page background.
                 def black_page_background(canvas, doc):
                     canvas.saveState()
                     canvas.setFillColor(colors.black)
@@ -4248,6 +5203,7 @@ def assets_page():
 # ======================
 # APPLIANCES PAGE   
 # ======================
+# Handle appliances page.
 def appliances_page():
     st.header("🔌 Appliances")
 
@@ -4735,6 +5691,19 @@ page = st.sidebar.radio(
     ],
     index =0
 )       
+with st.sidebar.expander("📨 Send Monthly Report"):
+    month_options = get_month_options(24)
+    if not month_options:
+        st.info("No monthly data found yet.")
+    else:
+        month_labels = [label for label, _ in month_options]
+        selected_label = st.selectbox("Select month", month_labels, index=0)
+        month_map = {label: dt for label, dt in month_options}
+        target_email = st.text_input("Send to email", value=SMTP_TO)
+        if st.button("Send Monthly Report"):
+            with st.spinner("Sending monthly report..."):
+                send_custom_monthly_report(month_map[selected_label], target_email)
+
 # ======================
 # PAGE ROUTING
 # ======================
@@ -4769,6 +5738,7 @@ st.markdown(                                                       # inject dire
 # ======================
 # BREADCRUMBS RENDERING
 # ======================
+# Render breadcrumbs.
 def render_breadcrumbs(page):                             
     st.markdown(
         f"""

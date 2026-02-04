@@ -24,3 +24,8 @@ dist/
 .DS_Store
 expense.db
 
+# Streamlit secrets/state
+.streamlit/
+.last_weekly_email.txt
+.last_monthly_email.txt
+.last_gdrive_backup.txt
