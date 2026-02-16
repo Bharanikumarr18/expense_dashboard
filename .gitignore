@@ -31,3 +31,12 @@ expense.db
 .last_weekly_email.txt
 .last_monthly_email.txt
 .last_gdrive_backup.txt
+
+# Local runtime state/log files
+.automation_log.json
+.last_*.txt
+.last_*.json
+
+# Local backup artifacts
+backups/
+expense_before_day_merge_*.db
