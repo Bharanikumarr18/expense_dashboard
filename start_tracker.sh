@@ -3,10 +3,21 @@
 APP_DIR="/home/bharani-kumar/Documents/expense_dashboard"
 CHROME_PROFILE="$APP_DIR/chrome-profile"
 PORT=8501
+PASSWORD="9271"
 
 cd "$APP_DIR" || exit 1
 
 source "$APP_DIR/venv/bin/activate"
+
+# Native password dialog (small window) before starting the app.
+entered_pw=$(zenity --password --title="Tracker Login")
+if [ $? -ne 0 ]; then
+  exit 1
+fi
+if [ "$entered_pw" != "$PASSWORD" ]; then
+  zenity --error --title="Tracker Login" --text="Incorrect password."
+  exit 1
+fi
 
 # Kill any previous streamlit
 pkill -f "streamlit run" 2>/dev/null
@@ -20,10 +31,8 @@ for i in {1..20}; do
   sleep 1
 done
 
-# Open as desktop-style app (NO browser UI)
+# Open as desktop-style app (NO browser UI) in fullscreen
 google-chrome \
   --user-data-dir="$CHROME_PROFILE" \
-  --app=http://localhost:$PORT \
-google-chrome \
-  --user-data-dir="$CHROME_PROFILE" \
-  --app=http://localhost:$PORT \
+  --start-fullscreen \
+  --app=http://localhost:$PORT

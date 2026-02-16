@@ -1,32 +1,63 @@
+import os
+import json
+import sqlite3
+import tempfile
 import datetime
 from datetime import date, timedelta
-import pandas as pd
 import io
+import shutil
 from io import BytesIO
-import json
-import re
-import os, time, platform, subprocess
+import pandas as pd
+import smtplib
+from email.message import EmailMessage
 
 from sqlalchemy import (
     DateTime, create_engine, Column, Integer, String,
     Float, Date, ForeignKey, UniqueConstraint, func, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from dateutil.relativedelta import relativedelta
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 from reportlab.lib.units import cm
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
 
 
+# ======================
+# CONFIGURATION
+# ======================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///expense.db")
+
+# Normalize sqlite path to avoid FileNotFoundError on missing directories.
+if DATABASE_URL.startswith("sqlite"):
+    db_path = None
+    if DATABASE_URL.startswith("sqlite:///"):
+        db_path = DATABASE_URL.replace("sqlite:///", "")
+    elif DATABASE_URL.startswith("sqlite:////"):
+        db_path = DATABASE_URL.replace("sqlite:////", "/")
+
+    if db_path:
+        if not os.path.isabs(db_path):
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            db_path = os.path.abspath(os.path.join(base_dir, db_path))
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        DATABASE_URL = f"sqlite:///{db_path}"
+
+engine_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    engine_args["connect_args"] = {"check_same_thread": False}
+
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True
+    pool_pre_ping=True,
+    **engine_args
 )
 
 SessionLocal = sessionmaker(
@@ -35,183 +66,440 @@ SessionLocal = sessionmaker(
     expire_on_commit=False
 )
 
+
+# ======================
+# DB HELPERS
+# ======================
 def get_db():
     return SessionLocal()
 
-def fetch_expense_dataframe():
-    with SessionLocal() as db:
-        q = (
-            db.query(
-                Expense.date,
-                Expense.amount,
-                Category.name.label("category"),
-                SubCategory.name.label("subcategory")
-            )
-            .join(Category, Expense.category_id == Category.id)
-            .join(SubCategory, Expense.subcategory_id == SubCategory.id)
-        )
-        return pd.DataFrame(
-            q.all(),
-            columns=["date", "amount", "category", "subcategory"]
-        )
 
-# ==============
+# ======================
 # MODELS
-# ==============
-Base = declarative_base()                               
-class Category(Base):                                   
-    __tablename__ = "categories"                         
-    id = Column(Integer, primary_key=True)               
-    name = Column(String, unique=True, nullable=False)  
-# ==============
-# SUBCATEGORY
-# ==============
-class SubCategory(Base):                                                
-    __tablename__ = "subcategories"                              
-    id = Column(Integer, primary_key=True)                        
-    name = Column(String, nullable=False)                         
-    category_id = Column(Integer, ForeignKey("categories.id"))    
-    __table_args__ = (UniqueConstraint("name", "category_id"),)   
-# ==============
-# EXPENSE
-# ==============
-class Expense(Base):                                                       
-    __tablename__ = "expenses"                                                  
-    id = Column(Integer, primary_key=True)                                      
-    category_id = Column(Integer, ForeignKey("categories.id"), index=True)      
-    subcategory_id = Column(Integer, ForeignKey("subcategories.id"), index=True)
-    date = Column(Date, nullable=False, index=True)                                
-    amount = Column(Float, nullable=False)                                     
-# ==============
-# INCOME MODELS
-# ==============
-class IncomeCategory(Base):                                           
-    __tablename__ = "income_categories"                                
-    id = Column(Integer, primary_key=True)                             
-    name = Column(String, unique=True, nullable=False)                 
-# ==================
-# INCOME SUBCATEGORY
-# ==================
-class IncomeSubCategory(Base):                                         
-    __tablename__ = "income_subcategories"                             
-    id = Column(Integer, primary_key=True)                             
-    name = Column(String, nullable=False)                              
-    category_id = Column(Integer, ForeignKey("income_categories.id"))  
-    __table_args__ = (UniqueConstraint("name", "category_id"),)        
-# =======
-# INCOME
-# =======
-class Income(Base):                                 
-    __tablename__ = "income"                       
-    id = Column(Integer, primary_key=True)        
-    category_id = Column(Integer, ForeignKey("income_categories.id"), index=True)        
-    subcategory_id = Column(Integer, ForeignKey("income_subcategories.id"), index=True)  
-    date = Column(Date, nullable=False, index=True)
-    amount = Column(Float, nullable=False)          
+# ======================
+Base = declarative_base()
 
-# ============
-# ASSET MODELS
-# ============
-#----METAL ASSETS----
-class MetalAsset(Base):                         
-    __tablename__ = "metal_assets"                
-    id = Column(Integer, primary_key=True)       
-    metal_type = Column(String, nullable=False)   
-    weight_grams = Column(Float, nullable=False)  
-    entry_date = Column(Date, nullable=False)     
-    created_at = Column(DateTime, default=datetime.datetime.utcnow) 
-#----LAND ASSETS----
+class Category(Base):
+    __tablename__ = "categories"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True, nullable=False)
+
+class SubCategory(Base):
+    __tablename__ = "subcategories"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    category_id = Column(Integer, ForeignKey("categories.id"))
+    __table_args__ = (UniqueConstraint("name", "category_id"),)
+
+class Expense(Base):
+    __tablename__ = "expenses"
+    id = Column(Integer, primary_key=True)
+    category_id = Column(Integer, ForeignKey("categories.id"), index=True)
+    subcategory_id = Column(Integer, ForeignKey("subcategories.id"), index=True)
+    date = Column(Date, nullable=False, index=True)
+    amount = Column(Float, nullable=False)
+    travel = Column(Integer, default=0)
+    trip_name = Column(String, nullable=True)
+    trip_start = Column(Date, nullable=True)
+    trip_end = Column(Date, nullable=True)
+
+class IncomeCategory(Base):
+    __tablename__ = "income_categories"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True, nullable=False)
+
+class IncomeSubCategory(Base):
+    __tablename__ = "income_subcategories"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    category_id = Column(Integer, ForeignKey("income_categories.id"))
+    __table_args__ = (UniqueConstraint("name", "category_id"),)
+
+class Income(Base):
+    __tablename__ = "income"
+    id = Column(Integer, primary_key=True)
+    category_id = Column(Integer, ForeignKey("income_categories.id"))
+    subcategory_id = Column(Integer, ForeignKey("income_subcategories.id"))
+    date = Column(Date, nullable=False)
+    amount = Column(Float, nullable=False)
+
+class AssetPrice(Base):
+    __tablename__ = "asset_prices"
+    id = Column(Integer, primary_key=True)
+    key = Column(String, unique=True, nullable=False)
+    value = Column(Float, nullable=False)
+
+class MetalAsset(Base):
+    __tablename__ = "metal_assets"
+    id = Column(Integer, primary_key=True)
+    metal = Column(String, nullable=False)
+    weight_grams = Column(Float, nullable=False)
+    buy_price = Column(Float, nullable=False)
+    buy_date = Column(Date, nullable=False)
+
 class LandAsset(Base):
     __tablename__ = "land_assets"
-    id = Column(Integer, primary_key=True)           
-    asset_id = Column(Integer, nullable=True)        
-    location = Column(String, nullable=False)        
-    area_unit = Column(String, nullable=False)      
-    area_size = Column(Float, nullable=False)        
-    price_per_unit = Column(Float, nullable=True)    
-# ----ASSET PRICES----
-class AssetPrice(Base):
-    __tablename__ = "asset_prices"          
-    key = Column(String, primary_key=True)  
-    value = Column(Float, nullable=False)    
-# ----FIXED DEPOSITS----
-class FixedDeposit(Base):                              
-    __tablename__ = "fixed_deposits"                  
-    id = Column(Integer, primary_key=True)            
-    name = Column(String, nullable=False)             
-    principal = Column(Float, nullable=False)         
-    rate = Column(Float, nullable=False)              
-    tenure_months = Column(Integer, nullable=False)         
-    deposit_date = Column(Date, nullable=False)       
-    maturity_date = Column(Date, nullable=False)      
-    status = Column(String, default="active")        
-    created_at = Column(DateTime, default=datetime.datetime.utcnow) 
-# ----APPLIANCES----
-class Appliance(Base):                                  
-    __tablename__ = "appliances"                      
-    id = Column(Integer, primary_key=True)             
-    name = Column(String, nullable=False)                     
-    price = Column(Float, nullable=False)                
-    purchase_date = Column(Date, nullable=False)        
-    warranty_expiry = Column(Date, nullable=True)       
-    depreciation_years = Column(Integer, nullable=True)  
-# ----APPLIANCE IMAGES----
-class ApplianceImage(Base):                                 
-    __tablename__ = "appliance_images"                       
-    id = Column(Integer, primary_key=True)                   
-    appliance_id = Column(Integer, ForeignKey("appliances.id", ondelete="CASCADE")) 
-    image_path = Column(String, nullable=False)              
-    appliance = relationship("Appliance", backref="images")  
-# ======================
-# LIC POLICIES (SIMPLE)
-# ======================
-class LICPolicy(Base):
-    __tablename__ = "lic_policies"
-
     id = Column(Integer, primary_key=True)
-    policy_name = Column(String, nullable=False)
-    premium_amount = Column(Float, nullable=False)
-    frequency = Column(String, nullable=False) 
-    last_premium_date = Column(Date, nullable=True)
+    location = Column(String, nullable=False)
+    size_sqft = Column(Float, nullable=False)
+    buy_price = Column(Float, nullable=False)
+    buy_date = Column(Date, nullable=False)
+
+class FixedDeposit(Base):
+    __tablename__ = "fixed_deposits"
+    id = Column(Integer, primary_key=True)
+    bank = Column(String, nullable=False)
+    principal = Column(Float, nullable=False)
+    rate = Column(Float, nullable=False)
+    deposit_date = Column(Date, nullable=False)
     maturity_date = Column(Date, nullable=False)
     maturity_amount = Column(Float, nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-
-# ======================
-# INVESTMENTS (STOCK / MF / ETF)
-# ======================
-class Investment(Base):
-    __tablename__ = "investments"
-
+class Appliance(Base):
+    __tablename__ = "appliances"
     id = Column(Integer, primary_key=True)
-    instrument = Column(String, nullable=False)      
-    name = Column(String, nullable=False)            
+    name = Column(String, nullable=False)
+    brand = Column(String, nullable=False)
+    model = Column(String, nullable=False)
+    purchase_date = Column(Date, nullable=False)
+    warranty_years = Column(Integer, nullable=False)
+    price = Column(Float, nullable=False)
+    image_path = Column(String, nullable=True)
+
+class LICPolicy(Base):
+    __tablename__ = "lic_policies"
+    id = Column(Integer, primary_key=True)
+    policy_name = Column(String, nullable=False)
+    policy_number = Column(String, nullable=False)
+    premium_amount = Column(Float, nullable=False)
+    premium_frequency = Column(String, nullable=False)
+    start_date = Column(Date, nullable=False)
+    maturity_date = Column(Date, nullable=False)
+    maturity_amount = Column(Float, nullable=False)
+
+class InvestmentCategory(Base):
+    __tablename__ = "investment_categories"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True, nullable=False)
+
+class InvestmentEntry(Base):
+    __tablename__ = "investment_entries"
+    id = Column(Integer, primary_key=True)
+    category_id = Column(Integer, ForeignKey("investment_categories.id"), nullable=False)
     units = Column(Float, nullable=False)
     buy_price = Column(Float, nullable=False)
     buy_date = Column(Date, nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    category = relationship("InvestmentCategory")
 
-Base.metadata.create_all(bind=engine)  
+Base.metadata.create_all(bind=engine)
 
-def migrate_appliances_schema():                         
-    with engine.connect() as conn:                      
-        existing_cols = conn.execute(                    
-            text("PRAGMA table_info(appliances)")        
-        ).fetchall()
-        existing_cols = {c[1] for c in existing_cols}   
 
-        if "warranty_expiry" not in existing_cols:         
-            conn.execute(
-                text("ALTER TABLE appliances ADD COLUMN warranty_expiry DATE")
-            )
-        if "depreciation_years" not in existing_cols:    
-            conn.execute(
-                text("ALTER TABLE appliances ADD COLUMN depreciation_years INTEGER") 
-            )
-migrate_appliances_schema()
+# ======================
+# DB MIGRATIONS
+# ======================
+def migrate_expense_travel():
+    try:
+        with engine.connect() as conn:
+            cols = conn.execute(text("PRAGMA table_info(expenses)")).fetchall()
+            col_names = {c[1] for c in cols}
+            if "travel" not in col_names:
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN travel INTEGER DEFAULT 0"))
+            if "trip_name" not in col_names:
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN trip_name VARCHAR"))
+            if "trip_start" not in col_names:
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN trip_start DATE"))
+            if "trip_end" not in col_names:
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN trip_end DATE"))
+    except Exception:
+        pass
 
-def load_expense_data():
+migrate_expense_travel()
+
+
+# ======================
+# BACKUP + STATE HELPERS
+# ======================
+GDRIVE_BACKUP_DIR = os.getenv(
+    "GDRIVE_BACKUP_DIR",
+    "/run/user/1000/gvfs/google-drive:host=gmail.com,user=bharanikumarr18/0AD1AeGLeY7L2Uk9PVA/1N9g1kGDrxiZpVq73wtodNM_ithFp5sl1"
+)
+BACKUP_FILENAME = "expense.db"
+BACKUP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_gdrive_backup.txt")
+BACKUP_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_gdrive_backup_meta.json")
+DB_MAINT_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_db_maintenance.txt")
+SECRETS_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".streamlit", "secrets.toml")
+AUTOMATION_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".automation_log.json")
+WEEKLY_EMAIL_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".last_weekly_email.txt"
+)
+MONTHLY_EMAIL_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".last_monthly_email.txt"
+)
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_TO = os.getenv("SMTP_TO", "")
+
+
+def read_state_value(path):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def write_state_value(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+    except Exception:
+        pass
+
+
+def read_backup_meta():
+    try:
+        with open(BACKUP_META_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_backup_meta(meta):
+    try:
+        with open(BACKUP_META_FILE, "w") as f:
+            json.dump(meta, f)
+    except Exception:
+        pass
+
+
+def update_automation_log(task, status, message):
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "status": status,
+        "message": message
+    }
+    try:
+        if os.path.exists(AUTOMATION_LOG_FILE):
+            with open(AUTOMATION_LOG_FILE, "r") as f:
+                data = json.load(f)
+        else:
+            data = {}
+        data[task] = entry
+        with open(AUTOMATION_LOG_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def create_sqlite_backup(src_path):
+    try:
+        tmp = tempfile.NamedTemporaryFile(prefix="tracker_backup_", suffix=".db", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        with sqlite3.connect(src_path) as src, sqlite3.connect(tmp_path) as dst:
+            src.backup(dst)
+        return tmp_path, None
+    except Exception as exc:
+        try:
+            if "tmp_path" in locals() and tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+        return None, str(exc)
+
+
+def resolve_gdrive_backup_dir():
+    if os.path.isdir(GDRIVE_BACKUP_DIR):
+        return GDRIVE_BACKUP_DIR, None
+
+    gvfs_base = os.path.join("/run/user", str(os.getuid()), "gvfs")
+    if not os.path.isdir(gvfs_base):
+        return None, "Google Drive is not mounted. Open Files and click Google Drive."
+
+    candidates = [
+        os.path.join(gvfs_base, name)
+        for name in os.listdir(gvfs_base)
+        if name.startswith("google-drive:")
+    ]
+
+    if len(candidates) == 1 and os.path.isdir(candidates[0]):
+        return candidates[0], None
+
+    if len(candidates) == 0:
+        return None, "Google Drive mount not found. Open Files and click Google Drive."
+
+    return None, "Multiple Google Drive mounts found. Set GDRIVE_BACKUP_DIR explicitly."
+
+
+def resolve_db_path():
+    if not DATABASE_URL.startswith("sqlite"):
+        return None, "Database URL is not SQLite; file backup is not supported."
+
+    db_path = "expense.db"
+    if DATABASE_URL.startswith("sqlite:///"):
+        db_path = DATABASE_URL.replace("sqlite:///", "")
+    elif DATABASE_URL.startswith("sqlite:////"):
+        db_path = DATABASE_URL.replace("sqlite:////", "/")
+
+    if not os.path.isabs(db_path):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.abspath(os.path.join(base_dir, db_path))
+
+    return db_path, None
+
+
+def backup_db_to_gdrive():
+    backup_dir, err = resolve_gdrive_backup_dir()
+    if err:
+        return False, err
+
+    db_path, err = resolve_db_path()
+    if err:
+        return False, err
+
+    if not db_path or not os.path.exists(db_path):
+        return False, "expense.db not found."
+
+    tmp_path = None
+    src_path = db_path
+    tmp_path, tmp_err = create_sqlite_backup(db_path)
+    if tmp_path:
+        src_path = tmp_path
+
+    dest = os.path.join(backup_dir, BACKUP_FILENAME)
+    last_exc = None
+    try:
+        shutil.copy2(src_path, dest)
+    except OSError:
+        try:
+            shutil.copyfile(src_path, dest)
+        except Exception as exc:
+            last_exc = exc
+
+    if last_exc:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        return False, f"Backup failed: {last_exc}"
+
+    try:
+        expected_size = os.path.getsize(src_path)
+        dest_size = os.path.getsize(dest)
+        if dest_size <= 0 or dest_size != expected_size:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            return False, "Backup verification failed: size mismatch."
+    except Exception as exc:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        return False, f"Backup verification failed: {exc}"
+
+    if tmp_path and os.path.exists(tmp_path):
+        os.unlink(tmp_path)
+
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    write_state_value(BACKUP_STATE_FILE, ts)
+    write_backup_meta({
+        "timestamp": ts,
+        "dest": dest,
+        "size": dest_size,
+        "source": db_path
+    })
+
+    return True, "Database backed up to Google Drive."
+
+
+def verify_gdrive_backup():
+    meta = read_backup_meta() or {}
+    backup_dir, err = resolve_gdrive_backup_dir()
+    if err:
+        return False, err
+
+    dest = meta.get("dest") or os.path.join(backup_dir, BACKUP_FILENAME)
+    if not os.path.exists(dest):
+        fallback_dest = os.path.join(backup_dir, BACKUP_FILENAME)
+        if not os.path.exists(fallback_dest):
+            return False, "Backup file not found in Google Drive."
+        dest = fallback_dest
+
+    try:
+        dest_size = os.path.getsize(dest)
+    except Exception as exc:
+        return False, f"Could not read backup file: {exc}"
+
+    if dest_size <= 0:
+        return False, "Backup verification failed: empty file."
+
+    expected_size = meta.get("size")
+    if expected_size is None:
+        return True, "Backup exists (no metadata to verify size)."
+
+    if dest_size != expected_size:
+        return False, "Backup verification failed: size mismatch."
+
+    return True, "Backup verified."
+
+
+def run_db_maintenance():
+    db_path, err = resolve_db_path()
+    if err:
+        return False, err
+    if not db_path or not os.path.exists(db_path):
+        return False, "expense.db not found."
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("PRAGMA optimize;")
+            conn.execute("VACUUM;")
+            conn.execute("ANALYZE;")
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        write_state_value(DB_MAINT_STATE_FILE, ts)
+        return True, "Database maintenance completed."
+    except Exception as exc:
+        return False, f"Maintenance failed: {exc}"
+
+
+def format_state_value(value):
+    if not value:
+        return "Never"
+    try:
+        if "T" in value:
+            dt = datetime.datetime.fromisoformat(value)
+            return dt.strftime("%d %b %Y %H:%M")
+        dt = datetime.datetime.strptime(value, "%Y-%m-%d")
+        return dt.strftime("%d %b %Y")
+    except Exception:
+        return value
+
+
+def format_bytes(num):
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(num)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+
+
+def get_db_size():
+    db_path, err = resolve_db_path()
+    if err:
+        return None, err
+    if not db_path or not os.path.exists(db_path):
+        return None, "expense.db not found."
+    try:
+        return os.path.getsize(db_path), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+# ======================
+# DATA ACCESS HELPERS
+# ======================
+def load_expense_data(refresh_key):
     with SessionLocal() as db:
         q = (
             db.query(
@@ -228,6 +516,167 @@ def load_expense_data():
             columns=["date", "amount", "category", "subcategory"]
         )
 
+
+def load_income_data(refresh_key):
+    with SessionLocal() as db:
+        q = (
+            db.query(
+                Income.id,
+                Income.date,
+                Income.amount,
+                IncomeCategory.name.label("category"),
+                IncomeSubCategory.name.label("subcategory")
+            )
+            .join(IncomeCategory, Income.category_id == IncomeCategory.id)
+            .join(IncomeSubCategory, Income.subcategory_id == IncomeSubCategory.id)
+            .order_by(Income.date.desc(), Income.id.desc())
+        )
+        return pd.DataFrame(
+            q.all(),
+            columns=["id", "date", "amount", "category", "subcategory"]
+        )
+
+
+def load_events_data(refresh_key):
+    with SessionLocal() as db:
+        q = (
+            db.query(
+                Expense.date,
+                Category.name.label("category"),
+                SubCategory.name.label("subcategory"),
+                Expense.amount,
+                Expense.trip_name,
+                Expense.trip_start,
+                Expense.trip_end
+            )
+            .join(Category, Expense.category_id == Category.id)
+            .join(SubCategory, Expense.subcategory_id == SubCategory.id)
+            .filter(Expense.travel == 1)
+            .order_by(Expense.date.desc(), Expense.id.desc())
+        )
+        return pd.DataFrame(
+            q.all(),
+            columns=["date", "category", "subcategory", "amount", "trip_name", "trip_start", "trip_end"]
+        )
+
+
+def load_event_list(refresh_key):
+    with SessionLocal() as db:
+        return (
+            db.query(Expense.trip_name, Expense.trip_start, Expense.trip_end)
+            .filter(Expense.travel == 1)
+            .filter(Expense.trip_name.isnot(None))
+            .distinct()
+            .order_by(Expense.trip_start.desc(), Expense.trip_end.desc())
+            .all()
+        )
+
+
+# ======================
+# BUSINESS RULES
+# ======================
+def add_months(start_date, months):
+    total = (start_date.year * 12 + (start_date.month - 1)) + months
+    year = total // 12
+    month = (total % 12) + 1
+    return date(year, month, 1)
+
+
+def get_month_options(months_back=24):
+    with SessionLocal() as db:
+        rows = db.query(Expense.date).all()
+    if not rows:
+        return []
+    month_counts = {}
+    for (d,) in rows:
+        if not d:
+            continue
+        month_start = date(d.year, d.month, 1)
+        month_counts[month_start] = month_counts.get(month_start, 0) + 1
+    options = [
+        (month.strftime("%b %Y"), month)
+        for month in sorted(month_counts.keys(), reverse=True)
+        if month_counts.get(month, 0) > 0
+    ]
+    return options
+
+
+def filter_expenses_for_dashboard(
+    df,
+    start_date,
+    end_date,
+    categories,
+    subcategories,
+    min_amount,
+    max_amount
+):
+    if df.empty:
+        return df
+
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"])
+
+    out = out[out["date"].between(pd.Timestamp(start_date), pd.Timestamp(end_date))]
+
+    if categories:
+        out = out[out["category"].isin(categories)]
+
+    if subcategories:
+        out = out[out["subcategory"].isin(subcategories)]
+
+    out = out[out["amount"].between(min_amount, max_amount)]
+
+    return out
+
+
+def build_monthly_snapshots(df):
+    if df.empty:
+        return []
+
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d["month"] = d["date"].dt.to_period("M")
+
+    results = []
+    for m, g in d.groupby("month"):
+        total = float(g["amount"].sum())
+        days = int(g["date"].dt.date.nunique())
+        avg_day = total / days if days else 0.0
+        tx = int(len(g))
+        peak_row = g.groupby(g["date"].dt.date)["amount"].sum().sort_values(ascending=False)
+        peak_day = peak_row.index[0] if not peak_row.empty else None
+        peak_amt = float(peak_row.iloc[0]) if not peak_row.empty else 0.0
+
+        top_cat = (
+            g.groupby("category")["amount"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        top_sub = (
+            g.groupby("subcategory")["amount"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+
+        results.append({
+            "period": m,
+            "label": m.strftime("%b %Y"),
+            "total": total,
+            "avg_day": avg_day,
+            "tx": tx,
+            "peak_day": peak_day,
+            "peak_amt": peak_amt,
+            "top_cat": top_cat.index[0] if not top_cat.empty else "—",
+            "top_sub": top_sub.index[0] if not top_sub.empty else "—",
+        })
+
+    results.sort(key=lambda x: x["period"], reverse=True)
+    return results
+
+
+# ======================
+# FINANCIAL FORMULAS
+# ======================
 def get_price(db, key, default=0.0):
     row = db.query(AssetPrice).filter(AssetPrice.key == key).first()
     return row.value if row else default
@@ -241,6 +690,7 @@ def set_price(db, key, value):
         db.add(AssetPrice(key=key, value=value))
     db.commit()
 
+
 def fd_current_value(principal, rate, deposit_date):
     days = (date.today() - deposit_date).days
     years = max(days, 0) / 365
@@ -251,262 +701,524 @@ def fd_maturity_value(principal, rate, tenure_months):
     years = tenure_months / 12
     return principal * ((1 + rate / 100) ** years)
 
-APPLIANCE_IMG_DIR = "appliance_images"
-os.makedirs(APPLIANCE_IMG_DIR, exist_ok=True)
 
+# ======================
+# PDF / REPORT HELPERS
+# ======================
 def black_page(canvas, doc):
     canvas.saveState()
     canvas.setFillColor(colors.black)
     canvas.rect(0, 0, doc.pagesize[0], doc.pagesize[1], stroke=0, fill=1)
     canvas.restoreState()
 
-# =============
-# EXPENSE FUNCTIONS
-# =============
-def create_expense(db, category_name, subcategory_name, date_value, amount):
-    if amount <= 0:
-        raise ValueError("Amount must be greater than 0")
 
-    cat = db.query(Category).filter_by(name=category_name).first()
-    if not cat:
-        raise ValueError("Invalid category")
-
-    sub = db.query(SubCategory).filter_by(
-        name=subcategory_name,
-        category_id=cat.id
-    ).first()
-    if not sub:
-        raise ValueError("Invalid subcategory")
-
-    expense = Expense(
-        category_id=cat.id,
-        subcategory_id=sub.id,
-        date=date_value,
-        amount=amount
-    )
-    db.add(expense)
-    db.commit()
-    return expense.id
-# ------ CATEGORY FUNCTIONS ------
-def create_category(db, name):
-    name = name.strip()
-    if not name:
-        raise ValueError("Category name cannot be empty")
-    if db.query(Category).filter_by(name=name).first():
-        raise ValueError("Category already exists")
-    db.add(Category(name=name))
-    db.commit()
-# ------ RENAME CATEGORY ------
-def rename_category(db, category_id, new_name):
-    new_name = new_name.strip()
-    if not new_name:
-        raise ValueError("Category name cannot be empty")
-    exists = db.query(Category).filter_by(name=new_name).first()
-    if exists and exists.id != category_id:
-        raise ValueError("Category name already exists")
-    cat = db.get(Category, category_id)
-    cat.name = new_name
-    db.commit()
-# ------ SUBCATEGORY FUNCTIONS ------
-def create_subcategory(db, category_id, name):
-    name = name.strip()
-    if not name:
-        raise ValueError("Subcategory name cannot be empty")
-    if db.query(SubCategory).filter_by(
-        name=name, category_id=category_id
-    ).first():
-        raise ValueError("Subcategory already exists in this category")
-    db.add(SubCategory(name=name, category_id=category_id))
-    db.commit()
-
-#------ RENAME SUBCATEGORY ------
-def rename_subcategory(db, subcategory_id, new_name):
-    new_name = new_name.strip()
-    if not new_name:
-        raise ValueError("Subcategory name cannot be empty")
-    sub = db.get(SubCategory, subcategory_id)
-    exists = db.query(SubCategory).filter_by(
-        name=new_name, category_id=sub.category_id
-    ).first()
-    if exists and exists.id != subcategory_id:
-        raise ValueError("Subcategory already exists in this category")
-    sub.name = new_name
-    db.commit()
-# ----- MOVE SUBCATEGORY ------
-def move_subcategory(db, subcategory_id, target_category_id):
-    sub = db.get(SubCategory, subcategory_id)
-    exists = db.query(SubCategory).filter_by(
-        name=sub.name,
-        category_id=target_category_id
-    ).first()
-    if exists:
-        raise ValueError("Subcategory already exists in target category")
-
-    sub.category_id = target_category_id
-
-    db.query(Expense).filter(
-        Expense.subcategory_id == sub.id
-    ).update(
-        {"category_id": target_category_id},
-        synchronize_session=False
-    )
-    db.commit()
-# ----- DELETE SUBCATEGORY / CATEGORY ------
-def delete_subcategory(db, subcategory_id):
-    db.query(Expense).filter_by(subcategory_id=subcategory_id).delete()
-    sub = db.get(SubCategory, subcategory_id)
-    db.delete(sub)
-    db.commit()
-
-#----- DELETE CATEGORY ------
-def delete_category(db, category_id):
-    db.query(Expense).filter_by(category_id=category_id).delete()
-    db.query(SubCategory).filter_by(category_id=category_id).delete()
-    cat = db.get(Category, category_id)
-    db.delete(cat)
-    db.commit()
-#---- FETCH EXPENSES ------
-def fetch_expenses(
-    db,
-    start_date,
-    end_date,
-    category_name=None,
-    subcategory_name=None,
-):
-    q = (
-        db.query(
-            Expense.id,
-            Expense.date,
-            Category.name.label("category"),
-            SubCategory.name.label("subcategory"),
-            Expense.amount
+def generate_weekly_expense_pdf(start_date, end_date):
+    with SessionLocal() as db:
+        rows = (
+            db.query(
+                Expense.date,
+                Category.name.label("category"),
+                SubCategory.name.label("subcategory"),
+                Expense.amount
+            )
+            .join(Category, Expense.category_id == Category.id)
+            .join(SubCategory, Expense.subcategory_id == SubCategory.id)
+            .filter(Expense.date.between(start_date, end_date))
+            .order_by(Expense.date.desc(), Expense.id.desc())
+            .all()
         )
-        .join(Category, Expense.category_id == Category.id)
-        .join(SubCategory, Expense.subcategory_id == SubCategory.id)
-        .filter(Expense.date.between(start_date, end_date))
+
+    df = pd.DataFrame(rows, columns=["date", "category", "subcategory", "amount"])
+    total = float(df["amount"].sum()) if not df.empty else 0.0
+    count = int(len(df))
+    avg = (total / count) if count else 0.0
+
+    cat_summary = (
+        df.groupby("category")["amount"].sum()
+        .sort_values(ascending=False)
+    ) if not df.empty else pd.Series(dtype=float)
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36
     )
 
-    if category_name and category_name != "All":
-        q = q.filter(Category.name == category_name)
-
-    if subcategory_name and subcategory_name != "All":
-        q = q.filter(SubCategory.name == subcategory_name)
-
-    return pd.DataFrame(
-        q.all(),
-        columns=["id", "date", "category", "subcategory", "amount"]
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="TitleBig",
+        fontName="DejaVu",
+        fontSize=18,
+        leading=22,
+        spaceAfter=10
+    ))
+    styles.add(ParagraphStyle(
+        name="SectionHeader",
+        fontName="DejaVu",
+        fontSize=12,
+        leading=16,
+        spaceBefore=10,
+        spaceAfter=6
+    ))
+    styles.add(ParagraphStyle(
+        name="BodySmall",
+        fontName="DejaVu",
+        fontSize=9,
+        leading=11
+    ))
+    table_header = ParagraphStyle(
+        name="TableHeader",
+        fontName="DejaVu",
+        fontSize=9,
+        leading=11
     )
-# ---- UPDATE EXPENSES BULK ------
-def update_expenses_bulk(db, rows):
-    """
-    rows = list of dicts:
-    {
-        id, date, category, subcategory, amount
-    }
-    """
-    with db.no_autoflush:
-        for row in rows:
-            exp = db.get(Expense, int(row["id"]))
-            if not exp:
-                continue
+    table_body = ParagraphStyle(
+        name="TableBody",
+        fontName="DejaVu",
+        fontSize=8,
+        leading=10,
+        wordWrap="CJK"
+    )
 
-            exp.date = pd.to_datetime(row["date"]).date()
-            exp.amount = float(row["amount"])
+    story = []
+    story.append(Paragraph("Weekly Expense Report", styles["TitleBig"]))
+    story.append(Paragraph(
+        f"Period: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}",
+        styles["BodySmall"]
+    ))
+    story.append(Paragraph(
+        f"Generated: {date.today().strftime('%d %b %Y')}",
+        styles["BodySmall"]
+    ))
+    story.append(Spacer(1, 10))
 
-            cat = db.query(Category).filter_by(name=row["category"]).first()
-            if not cat:
-                continue
+    story.append(Paragraph("Summary", styles["SectionHeader"]))
+    summary_data = [
+        ["Total Expense (₹)", f"{total:,.2f}"],
+        ["Transactions", f"{count}"],
+        ["Average per Transaction (₹)", f"{avg:,.2f}"],
+    ]
+    summary_table = Table(summary_data, colWidths=[300, 110], hAlign="LEFT")
+    summary_table.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "DejaVu"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 10))
 
-            sub = db.query(SubCategory).filter_by(
-                name=row["subcategory"],
-                category_id=cat.id
-            ).first()
+    story.append(Paragraph("Category Totals", styles["SectionHeader"]))
+    if cat_summary.empty:
+        story.append(Paragraph("No expenses recorded in this period.", styles["BodySmall"]))
+    else:
+        cat_rows = [[
+            Paragraph("Category", table_header),
+            Paragraph("Total (₹)", table_header)
+        ]]
+        for cat, amt in cat_summary.items():
+            cat_rows.append([
+                Paragraph(str(cat), table_body),
+                Paragraph(f"{amt:,.2f}", table_body)
+            ])
+        cat_table = Table(cat_rows, colWidths=[320, 110], hAlign="LEFT", repeatRows=1)
+        cat_table.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, -1), "DejaVu"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(cat_table)
+    story.append(Spacer(1, 10))
 
-            if sub:
-                exp.category_id = cat.id
-                exp.subcategory_id = sub.id
+    doc.build(story)
+    return buffer.getvalue()
 
-    db.commit()
-#---- DELETE EXPENSES BY IDS ------
-def delete_expenses_by_ids(db, expense_ids):
-    for eid in expense_ids:
-        exp = db.get(Expense, int(eid))
-        if exp:
-            db.delete(exp)
-    db.commit()
-#---- DELETE EXPENSES BULK ------
-def delete_expenses_bulk(db, expense_ids):
-    db.query(Expense).filter(
-        Expense.id.in_(expense_ids)
-    ).delete(synchronize_session=False)
-    db.commit()
-#--- MONTH SUMMARY ------
-def get_month_summary(db, start_date, end_date):
-    total_income = (
-        db.query(func.sum(Income.amount))
-        .filter(Income.date.between(start_date, end_date))
-        .scalar()
-    ) or 0
 
-    total_expense = (
-        db.query(func.sum(Expense.amount))
-        .filter(Expense.date.between(start_date, end_date))
-        .scalar()
-    ) or 0
-
-    return {
-        "income": total_income,
-        "expense": total_expense,
-        "net": total_income - total_expense,
-    }
-# --- DAILY EXPENSE BREAKDOWN ------
-def get_daily_expense_breakdown(db, target_date):
-    rows = (
-        db.query(
-            SubCategory.name.label("subcategory"),
-            func.sum(Expense.amount).label("amount")
+def generate_monthly_expense_pdf(start_date, end_date):
+    with SessionLocal() as db:
+        rows = (
+            db.query(
+                Expense.date,
+                Category.name.label("category"),
+                SubCategory.name.label("subcategory"),
+                Expense.amount
+            )
+            .join(Category, Expense.category_id == Category.id)
+            .join(SubCategory, Expense.subcategory_id == SubCategory.id)
+            .filter(Expense.date.between(start_date, end_date))
+            .order_by(Expense.date.desc(), Expense.id.desc())
+            .all()
         )
-        .join(SubCategory, Expense.subcategory_id == SubCategory.id)
-        .filter(Expense.date == target_date)
-        .group_by(SubCategory.name)
-        .order_by(func.sum(Expense.amount).desc())
-        .all()
+
+    df = pd.DataFrame(rows, columns=["date", "category", "subcategory", "amount"])
+    total = float(df["amount"].sum()) if not df.empty else 0.0
+    count = int(len(df))
+    avg = (total / count) if count else 0.0
+
+    cat_summary = (
+        df.groupby("category")["amount"].sum()
+        .sort_values(ascending=False)
+    ) if not df.empty else pd.Series(dtype=float)
+
+    subcat_summary = (
+        df.groupby("subcategory")["amount"].sum()
+        .sort_values(ascending=False)
+    ) if not df.empty else pd.Series(dtype=float)
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36
     )
 
-    total = (
-        db.query(func.sum(Expense.amount))
-        .filter(Expense.date == target_date)
-        .scalar()
-    ) or 0
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="TitleBig",
+        fontName="DejaVu",
+        fontSize=18,
+        leading=22,
+        spaceAfter=10
+    ))
+    styles.add(ParagraphStyle(
+        name="SectionHeader",
+        fontName="DejaVu",
+        fontSize=12,
+        leading=16,
+        spaceBefore=10,
+        spaceAfter=6
+    ))
+    styles.add(ParagraphStyle(
+        name="BodySmall",
+        fontName="DejaVu",
+        fontSize=9,
+        leading=11
+    ))
+    table_header = ParagraphStyle(
+        name="TableHeader",
+        fontName="DejaVu",
+        fontSize=9,
+        leading=11
+    )
+    table_body = ParagraphStyle(
+        name="TableBody",
+        fontName="DejaVu",
+        fontSize=8,
+        leading=10,
+        wordWrap="CJK"
+    )
 
-    return {
-        "items": [{"subcategory": r.subcategory, "amount": r.amount} for r in rows],
-        "total": total,
-    }
-# ---- TOTAL EXPENSE BETWEEN ------
-def get_total_expense_between(db, start_date, end_date):
-    return (
-        db.query(func.sum(Expense.amount))
-        .filter(Expense.date.between(start_date, end_date))
-        .scalar()
-    ) or 0
-#--- AGGREGATE BY CATEGORY / SUBCATEGORY ------
-def aggregate_by_category(df):
-    return (
-        df.groupby("category", as_index=False)["amount"]
-        .sum()
-        .sort_values("amount", ascending=False)
+    story = []
+    story.append(Paragraph("Monthly Expense Report", styles["TitleBig"]))
+    story.append(Paragraph(
+        f"Period: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}",
+        styles["BodySmall"]
+    ))
+    story.append(Paragraph(
+        f"Generated: {date.today().strftime('%d %b %Y')}",
+        styles["BodySmall"]
+    ))
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Summary", styles["SectionHeader"]))
+    summary_data = [
+        ["Total Expense (₹)", f"{total:,.2f}"],
+        ["Transactions", f"{count}"],
+        ["Average per Transaction (₹)", f"{avg:,.2f}"],
+    ]
+    summary_table = Table(summary_data, colWidths=[300, 110], hAlign="LEFT")
+    summary_table.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "DejaVu"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Category Totals", styles["SectionHeader"]))
+    if cat_summary.empty:
+        story.append(Paragraph("No expenses recorded in this period.", styles["BodySmall"]))
+    else:
+        cat_rows = [[
+            Paragraph("Category", table_header),
+            Paragraph("Total (₹)", table_header)
+        ]]
+        for cat, amt in cat_summary.items():
+            cat_rows.append([
+                Paragraph(str(cat), table_body),
+                Paragraph(f"{amt:,.2f}", table_body)
+            ])
+        cat_table = Table(cat_rows, colWidths=[320, 110], hAlign="LEFT", repeatRows=1)
+        cat_table.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, -1), "DejaVu"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(cat_table)
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Subcategory Totals", styles["SectionHeader"]))
+    if subcat_summary.empty:
+        story.append(Paragraph("No subcategory data for this period.", styles["BodySmall"]))
+    else:
+        subcat_rows = [[
+            Paragraph("Subcategory", table_header),
+            Paragraph("Total (₹)", table_header)
+        ]]
+        for subcat, amt in subcat_summary.items():
+            subcat_rows.append([
+                Paragraph(str(subcat), table_body),
+                Paragraph(f"{amt:,.2f}", table_body)
+            ])
+        subcat_table = Table(
+            subcat_rows,
+            colWidths=[320, 110],
+            hAlign="LEFT",
+            repeatRows=1
+        )
+        subcat_table.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, -1), "DejaVu"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(subcat_table)
+    story.append(Spacer(1, 12))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+# ======================
+# EMAIL LOGIC
+# ======================
+def send_weekly_email_report_core():
+    today = date.today()
+    if today.weekday() != 6:
+        return False, "Not Sunday"
+
+    last = read_state_value(WEEKLY_EMAIL_STATE_FILE)
+    if last == today.isoformat():
+        return False, "Already sent today"
+
+    if not SMTP_USER or not SMTP_PASS or not SMTP_TO:
+        return False, "SMTP credentials not configured"
+
+    end_date = today - timedelta(days=1)
+    start_date = end_date - timedelta(days=6)
+    pdf_bytes = generate_weekly_expense_pdf(start_date, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Weekly Expense Report ({start_date} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = SMTP_TO
+    msg.set_content(
+        "Hello,\n\n"
+        "Attached is your weekly expense report.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
     )
-# --- AGGREGATE BY SUBCATEGORY ------
-def aggregate_by_subcategory(df, category_name):
-    return (
-        df[df["category"] == category_name]
-        .groupby("subcategory", as_index=False)["amount"]
-        .sum()
-        .sort_values("amount", ascending=False)
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_{start_date}_{end_date}.pdf"
     )
-# ---- EXPORT PDF ------
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        write_state_value(WEEKLY_EMAIL_STATE_FILE, today.isoformat())
+        return True, "Weekly email report sent."
+    except Exception as e:
+        return False, f"Weekly email failed: {e}"
+
+
+def send_test_email_report_core():
+    if not SMTP_USER or not SMTP_PASS or not SMTP_TO:
+        return False, "SMTP credentials not configured"
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=6)
+    pdf_bytes = generate_weekly_expense_pdf(start_date, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Test Expense Report ({start_date} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = SMTP_TO
+    msg.set_content(
+        "Hello,\n\n"
+        "This is a test email from your Expense Tracker.\n"
+        "Attached is a sample report for the last 7 days.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_test_{start_date}_{end_date}.pdf"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        return True, "Test email sent successfully."
+    except Exception as e:
+        return False, f"Test email failed: {e}"
+
+
+def send_monthly_email_report_core():
+    today = date.today()
+    if today.day != 3:
+        return False, "Not scheduled day"
+
+    last = read_state_value(MONTHLY_EMAIL_STATE_FILE)
+    if last == today.isoformat():
+        return False, "Already sent today"
+
+    if not SMTP_USER or not SMTP_PASS or not SMTP_TO:
+        return False, "SMTP credentials not configured"
+
+    current_month_start = date(today.year, today.month, 1)
+    end_date = current_month_start - timedelta(days=1)
+    start_date = date(end_date.year, end_date.month, 1)
+    pdf_bytes = generate_monthly_expense_pdf(start_date, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Monthly Expense Report ({start_date} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = SMTP_TO
+    msg.set_content(
+        "Hello,\n\n"
+        "Attached is your monthly expense report.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_{start_date}_{end_date}.pdf"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        write_state_value(MONTHLY_EMAIL_STATE_FILE, today.isoformat())
+        return True, "Monthly email report sent."
+    except Exception as e:
+        return False, f"Monthly email failed: {e}"
+
+
+def send_test_monthly_email_report_core():
+    if not SMTP_USER or not SMTP_PASS or not SMTP_TO:
+        return False, "SMTP credentials not configured"
+
+    today = date.today()
+    current_month_start = date(today.year, today.month, 1)
+    end_date = current_month_start - timedelta(days=1)
+    start_date = date(end_date.year, end_date.month, 1)
+
+    pdf_bytes = generate_monthly_expense_pdf(start_date, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Test Monthly Report ({start_date} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = SMTP_TO
+    msg.set_content(
+        "Hello,\n\n"
+        "This is a test monthly report from your Expense Tracker.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_test_{start_date}_{end_date}.pdf"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        return True, "Monthly test email sent successfully."
+    except Exception as e:
+        return False, f"Monthly test email failed: {e}"
+
+
+def send_custom_monthly_report_core(month_start, target_email):
+    if not SMTP_USER or not SMTP_PASS:
+        return False, "SMTP credentials not configured"
+    if not target_email or "@" not in target_email:
+        return False, "Please enter a valid email address."
+
+    end_date = add_months(month_start, 1) - timedelta(days=1)
+    pdf_bytes = generate_monthly_expense_pdf(month_start, end_date)
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Monthly Expense Report ({month_start} to {end_date})"
+    msg["From"] = SMTP_USER
+    msg["To"] = target_email
+    msg.set_content(
+        "Hello,\n\n"
+        f"Attached is the monthly expense report for {month_start.strftime('%b %Y')}.\n"
+        "It includes category totals and subcategory totals.\n\n"
+        "Regards,\n"
+        "Expense Tracker"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"expense_report_{month_start}_{end_date}.pdf"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        return True, "Monthly report sent successfully."
+    except Exception as e:
+        return False, f"Monthly report failed: {e}"
+
+
 def export_pdf(df, footer_text=""):
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -516,10 +1228,7 @@ def export_pdf(df, footer_text=""):
         topMargin=30,
         bottomMargin=30
     )
-
     data = [df.columns.tolist()] + df.values.tolist()
-
-    # Do NOT auto-add TOTAL if already present
     if "Category" in df.columns and "TOTAL" in df["Category"].values:
         total_amount = None
     else:
@@ -531,7 +1240,8 @@ def export_pdf(df, footer_text=""):
             total_amount = None
 
     if total_amount is not None:
-        data.append(["", "", "TOTAL", f"{total_amount:.2f}"])
+        row = [""] * (len(df.columns) - 2) + ["TOTAL", f"{total_amount:.2f}"]
+        data.append(row)
 
     table = Table(data, repeatRows=1, hAlign="CENTER")
     table.setStyle(TableStyle([
@@ -545,6 +1255,16 @@ def export_pdf(df, footer_text=""):
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
+
+    styles = getSampleStyleSheet()
+
+    title_style = styles["Title"]
+    title_style.textColor = colors.white
+    title_style.alignment = 1
+
+    meta_style = styles["Normal"]
+    meta_style.textColor = colors.white
+    meta_style.leading = 14
 
     def draw_footer(canvas, doc):
         canvas.saveState()
@@ -560,8 +1280,38 @@ def export_pdf(df, footer_text=""):
         footer_para.drawOn(canvas, 20, 20)
         canvas.restoreState()
 
+    def header_block(text):
+        return Table(
+            [[Paragraph(text.replace(" | ", "<br/>"), meta_style)]],
+            colWidths=[doc.width],
+            style=[
+                ("BACKGROUND", (0, 0), (-1, -1), colors.black),
+                ("LEFTPADDING", (0, 0), (-1, -1), 16),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 16),
+                ("TOPPADDING", (0, 0), (-1, -1), 14),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+            ]
+        )
+
+    story = []
+    story.append(Paragraph("EXPENSES REPORT", title_style))
+    story.append(header_block(footer_text))
+    story.append(Spacer(1, 16))
+
+    story.append(Table(
+        [[""]],
+        colWidths=[doc.width],
+        style=[
+            ("LINEBELOW", (0, 0), (-1, -1), 1, colors.white),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]
+    ))
+
+    story.append(table)
+
     doc.build(
-        [table],
+        story,
         onFirstPage=lambda c, d: (black_page(c, d), draw_footer(c, d)),
         onLaterPages=lambda c, d: (black_page(c, d), draw_footer(c, d))
     )
@@ -569,749 +1319,92 @@ def export_pdf(df, footer_text=""):
     buffer.seek(0)
     return buffer
 
-def fetch_expenses_for_export(db, start_date, end_date, category="All", subcategory="All"):
-    q = (
-        db.query(
-            Expense.date.label("Date"),
-            Category.name.label("Category"),
-            SubCategory.name.label("Subcategory"),
-            Expense.amount.label("Amount")
-        )
-        .join(Category, Expense.category_id == Category.id)
-        .join(SubCategory, Expense.subcategory_id == SubCategory.id)
-        .filter(
-            Expense.date.between(start_date, end_date)
-        )
-    )
 
-    if category != "All":
-        q = q.filter(Category.name == category)
-
-    if subcategory != "All":
-        q = q.filter(SubCategory.name == subcategory)
-
-    return pd.DataFrame(q.all())
-
-def fetch_expense_summary(
-    db,
-    start_date,
-    end_date,
-    categories,
-    subcategory_ids=None
-):
-    q = (
-        db.query(
-            Category.name.label("Category"),
-            SubCategory.name.label("Subcategory"),
-            func.sum(Expense.amount).label("Total Amount")
-        )
-        .join(Category, Expense.category_id == Category.id)
-        .join(SubCategory, Expense.subcategory_id == SubCategory.id)
-        .filter(
-            Expense.date.between(start_date, end_date),
-            Category.name.in_(categories)
-        )
-    )
-
-    if subcategory_ids:
-        q = q.filter(SubCategory.id.in_(subcategory_ids))
-
-    return pd.DataFrame(
-        q.group_by(Category.name, SubCategory.name).all()
-    )
-
-def compute_category_totals(df):
-    cat_total_df = (
-        df.groupby("Category", as_index=False)["Total Amount"]
-        .sum()
-    )
-
-    total_value = cat_total_df["Total Amount"].sum()
-
-    total_row = pd.DataFrame([{
-        "Category": "TOTAL",
-        "Total Amount": total_value
-    }])
-
-    return pd.concat([cat_total_df, total_row], ignore_index=True)
-
-
-# =============
-# INCOME FUNCTIONS
-# =============
-def create_income(db, category_name, subcategory_name, date_value, amount):
-    if amount <= 0:
-        raise ValueError("Amount must be greater than 0")
-
-    cat = db.query(IncomeCategory).filter_by(name=category_name).first()
-    if not cat:
-        raise ValueError("Invalid income category")
-
-    sub = db.query(IncomeSubCategory).filter_by(
-        name=subcategory_name,
-        category_id=cat.id
-    ).first()
-    if not sub:
-        raise ValueError("Invalid income subcategory")
-
-    inc = Income(
-        category_id=cat.id,
-        subcategory_id=sub.id,
-        date=date_value,
-        amount=amount
-    )
-    db.add(inc)
-    db.commit()
-    return inc.id
-
-def fetch_income(db):
-    return pd.DataFrame(
-        db.query(
-            Income.id,
-            Income.date,
-            Income.amount,
-            IncomeCategory.name.label("category"),
-            IncomeSubCategory.name.label("subcategory")
-        )
-        .join(IncomeCategory, Income.category_id == IncomeCategory.id)
-        .join(IncomeSubCategory, Income.subcategory_id == IncomeSubCategory.id)
-        .all(),
-        columns=["id", "date", "amount", "category", "subcategory"]
-    )
-
-def filter_income_by_period(df, start_date, end_date):
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    return df[df["date"].between(start_date, end_date)]
-
-def get_income_expense_summary(db, start_date, end_date):
-    total_income = (
-        db.query(func.sum(Income.amount))
-        .filter(Income.date.between(start_date, end_date))
-        .scalar()
-    ) or 0
-
-    total_expense = (
-        db.query(func.sum(Expense.amount))
-        .filter(Expense.date.between(start_date, end_date))
-        .scalar()
-    ) or 0
-
-    return {
-        "income": total_income,
-        "expense": total_expense,
-        "net": total_income - total_expense,
-    }
-
-def filter_income_entries(df, category=None, subcategory=None):
-    filtered = df.copy()
-
-    if category and category != "All":
-        filtered = filtered[filtered["category"] == category]
-
-    if subcategory and subcategory != "All":
-        filtered = filtered[filtered["subcategory"] == subcategory]
-
-    return filtered
-
-def update_income_bulk(db, rows):
-    """
-    rows: list of dicts with keys
-    id, date, amount, category, subcategory
-    """
-    with db.no_autoflush:
-        for row in rows:
-            inc = db.get(Income, int(row["id"]))
-            if not inc:
-                continue
-
-            inc.date = pd.to_datetime(row["date"]).date()
-            inc.amount = float(row["amount"])
-
-            cat = db.query(IncomeCategory).filter_by(
-                name=row["category"]
-            ).first()
-            if not cat:
-                continue
-
-            sub = db.query(IncomeSubCategory).filter_by(
-                name=row["subcategory"],
-                category_id=cat.id
-            ).first()
-            if not sub:
-                continue
-
-            inc.category_id = cat.id
-            inc.subcategory_id = sub.id
-
-    db.commit()
-
-def delete_income_by_ids(db, income_ids):
-    for iid in income_ids:
-        inc = db.get(Income, int(iid))
-        if inc:
-            db.delete(inc)
-    db.commit()
-
-def create_income_category(db, name):
-    name = name.strip()
-    if not name:
-        raise ValueError("Category name cannot be empty")
-    if db.query(IncomeCategory).filter_by(name=name).first():
-        raise ValueError("Income category already exists")
-    db.add(IncomeCategory(name=name))
-    db.commit()
-
-def create_income_subcategory(db, category_id, name):
-    name = name.strip()
-    if not name:
-        raise ValueError("Subcategory name cannot be empty")
-    if db.query(IncomeSubCategory).filter_by(
-        name=name,
-        category_id=category_id
-    ).first():
-        raise ValueError("Income subcategory already exists in this category")
-
-    db.add(
-        IncomeSubCategory(
-            name=name,
-            category_id=category_id
-        )
-    )
-    db.commit()
-
-def rename_income_category(db, category_id, new_name):
-    new_name = new_name.strip()
-    if not new_name:
-        raise ValueError("Category name cannot be empty")
-
-    exists = db.query(IncomeCategory).filter_by(name=new_name).first()
-    if exists and exists.id != category_id:
-        raise ValueError("Income category already exists")
-
-    cat = db.get(IncomeCategory, category_id)
-    cat.name = new_name
-    db.commit()
-
-def rename_income_subcategory(db, subcategory_id, new_name):
-    new_name = new_name.strip()
-    if not new_name:
-        raise ValueError("Subcategory name cannot be empty")
-
-    sub = db.get(IncomeSubCategory, subcategory_id)
-    exists = db.query(IncomeSubCategory).filter_by(
-        name=new_name,
-        category_id=sub.category_id
-    ).first()
-
-    if exists and exists.id != subcategory_id:
-        raise ValueError("Income subcategory already exists")
-
-    sub.name = new_name
-    db.commit()
-
-def delete_income_subcategory(db, subcategory_id):
-    db.query(Income).filter(
-        Income.subcategory_id == subcategory_id
-    ).delete()
-
-    sub = db.get(IncomeSubCategory, subcategory_id)
-    db.delete(sub)
-    db.commit()
-
-def delete_income_category(db, category_id):
-    db.query(Income).filter(
-        Income.category_id == category_id
-    ).delete()
-
-    db.query(IncomeSubCategory).filter(
-        IncomeSubCategory.category_id == category_id
-    ).delete()
-
-    cat = db.get(IncomeCategory, category_id)
-    db.delete(cat)
-    db.commit()
-
-def fetch_income_for_export(db):
-    df = pd.DataFrame(
-        db.query(
-            Income.id,
-            Income.date,
-            Income.amount,
-            IncomeCategory.name.label("category"),
-            IncomeSubCategory.name.label("subcategory")
-        )
-        .join(IncomeCategory, Income.category_id == IncomeCategory.id)
-        .join(IncomeSubCategory, Income.subcategory_id == IncomeSubCategory.id)
-        .all(),
-        columns=["NOs", "date", "amount", "category", "subcategory"]
-    )
-
-    if not df.empty:
-        df["date"] = pd.to_datetime(df["date"])
-
-    return df
-
-def filter_income_export(
-    df,
-    start_date,
-    end_date,
-    category="All",
-    subcategory="All"
-):
-    fdf = df[df["date"].between(start_date, end_date)]
-
-    if category != "All":
-        fdf = fdf[fdf["category"] == category]
-
-    if subcategory != "All":
-        fdf = fdf[fdf["subcategory"] == subcategory]
-
-    return fdf
-
-def generate_income_pdf(df):
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(
-        name="WhiteNormal",
-        fontName="DejaVu",
-        fontSize=10,
-        textColor=colors.white
-    ))
-    styles.add(ParagraphStyle(
-        name="WhiteHeading",
-        fontName="DejaVu",
-        fontSize=14,
-        textColor=colors.white,
-        spaceAfter=10
-    ))
-    styles.add(ParagraphStyle(
-        name="WhiteTitle",
-        fontName="DejaVu",
-        fontSize=18,
-        textColor=colors.white,
-        spaceAfter=14
-    ))
-
-    story = []
-
-    story.append(Paragraph("Income Report", styles["WhiteTitle"]))
-    story.append(Paragraph(
-        f"Generated on: {datetime.date.today()}",
-        styles["WhiteNormal"]
-    ))
-    story.append(Spacer(1, 12))
-
-    df = df.copy()
-    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-    df["amount"] = df["amount"].round(2)
-
-    total_income = df["amount"].sum()
-
-    table_data = [list(df.columns)] + df.values.tolist()
-    table_data.append(["", "", "TOTAL", "", f"{total_income:,.2f}"])
-
-    table = Table(table_data, repeatRows=1)
-    table.setStyle(TableStyle([
-        ("FONT", (0,0), (-1,-1), "DejaVu"),
-        ("BACKGROUND", (0,0), (-1,0), colors.black),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("BACKGROUND", (0,1), (-1,-2), colors.black),
-        ("TEXTCOLOR", (0,1), (-1,-1), colors.white),
-        ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
-        ("BACKGROUND", (-2,-1), (-1,-1), colors.black),
-    ]))
-
-    story.append(table)
-    story.append(Spacer(1, 20))
-    story.append(Paragraph(
-        f"GRAND TOTAL INCOME: ₹ {total_income:,.2f}",
-        styles["WhiteHeading"]
-    ))
-
-    def black_bg(canvas, doc):
-        canvas.saveState()
-        canvas.setFillColor(colors.black)
-        canvas.rect(0, 0, doc.pagesize[0], doc.pagesize[1], fill=1)
-        canvas.restoreState()
-
-    doc.build(
-        story,
-        onFirstPage=black_bg,
-        onLaterPages=black_bg
-    )
-
-    buffer.seek(0)
-    return buffer.getvalue()
-
-# =============
-# ASSET FUNCTIONS
-# =============
-def compute_asset_valuation(db):
-    # Metals
-    gold_grams = db.query(func.sum(MetalAsset.weight_grams))\
-        .filter(MetalAsset.metal_type == "Gold").scalar() or 0
-    silver_grams = db.query(func.sum(MetalAsset.weight_grams))\
-        .filter(MetalAsset.metal_type == "Silver").scalar() or 0
-
-    gold_price = get_price(db, "gold_price", 0.0)
-    silver_price = get_price(db, "silver_price", 0.0)
-
-    gold_value = gold_grams * gold_price
-    silver_value = silver_grams * silver_price
-    metal_total = gold_value + silver_value
-
-    # Land
-    land_df = pd.read_sql(
-        "SELECT location, SUM(area_size) AS sqft FROM land_assets GROUP BY location",
-        engine
-    )
-
-    land_values = {}
-    land_total = 0.0
-    for _, r in land_df.iterrows():
-        key = f"land:{r['location']}"
-        price = get_price(db, key, 0.0)
-        val = r["sqft"] * price
-        land_values[r["location"]] = val
-        land_total += val
-
-    # Fixed Deposits
-    today = date.today()
-    fd_total = 0.0
-    fds = db.query(FixedDeposit).all()
-    for fd in fds:
-        if fd.status == "active":
-            if today >= fd.maturity_date:
-                fd.status = "matured"
-            else:
-                fd_total += fd_current_value(fd.principal, fd.rate, fd.deposit_date)
-    db.commit()
-
-    return {
-        "gold": gold_value,
-        "silver": silver_value,
-        "metals_total": metal_total,
-        "land_values": land_values,
-        "land_total": land_total,
-        "fd_total": fd_total,
-        "grand_total": metal_total + land_total + fd_total,
-    }
-
-def create_metal_asset(db, metal_type, weight_grams, entry_date):
-    if weight_grams <= 0:
-        raise ValueError("Weight must be positive")
-    db.add(MetalAsset(
-        metal_type=metal_type,
-        weight_grams=weight_grams,
-        entry_date=entry_date
-    ))
-    db.commit()
-
-
-def update_metal_assets(db, rows):
-    for r in rows:
-        a = db.get(MetalAsset, int(r["id"]))
-        if a:
-            a.metal_type = r["Metal"]
-            a.weight_grams = float(r["Weight (g)"])
-            a.entry_date = pd.to_datetime(r["Date"]).date()
-    db.commit()
-
-
-def delete_metal_assets(db, ids):
-    for i in ids:
-        a = db.get(MetalAsset, int(i))
-        if a:
-            db.delete(a)
-    db.commit()
-
-def create_land_asset(db, location, sqft):
-    if not location or sqft <= 0:
-        raise ValueError("Invalid land input")
-    db.add(LandAsset(
-        location=location,
-        area_unit="sqft",
-        area_size=sqft
-    ))
-    db.commit()
-
-
-def update_land_assets(db, rows):
-    for r in rows:
-        l = db.get(LandAsset, int(r["id"]))
-        if l:
-            l.location = r["Place"]
-            l.area_size = float(r["Sqft"])
-    db.commit()
-
-
-def delete_land_assets(db, ids):
-    for i in ids:
-        l = db.get(LandAsset, int(i))
-        if l:
-            db.delete(l)
-    db.commit()
-
-def create_fixed_deposit(
-    db, name, principal, rate, tenure_months, deposit_date
-):
-    if not name or principal <= 0 or rate <= 0 or tenure_months < 1:
-        raise ValueError("Invalid FD details")
-
-    maturity_date = deposit_date + relativedelta(months=tenure_months)
-
-    db.add(FixedDeposit(
-        name=name,
-        principal=principal,
-        rate=rate,
-        tenure_months=tenure_months,
-        deposit_date=deposit_date,
-        maturity_date=maturity_date,
-        status="active"
-    ))
-    db.commit()
-
-
-def update_active_fds(db, rows):
-    for row in rows:
-        fd = db.get(FixedDeposit, int(row["id"]))
-        if fd:
-            fd.name = row["Name"]
-            fd.principal = float(row["Principal"])
-            fd.rate = float(row["Rate (%)"])
-            fd.deposit_date = pd.to_datetime(row["Deposit Date"]).date()
-            fd.tenure_months = int(row["Tenure (Months)"])
-            fd.maturity_date = fd.deposit_date + relativedelta(
-                months=fd.tenure_months
-            )
-    db.commit()
-
-def delete_fixed_deposits(db, ids):
-    for i in ids:
-        fd = db.get(FixedDeposit, int(i))
-        if fd:
-            db.delete(fd)
-    db.commit()
-
-def renew_fixed_deposit(db, fd_id):
-    old = db.get(FixedDeposit, int(fd_id))
-    if not old:
-        return
-
-    new_dep = date.today()
-    new_mat = new_dep + relativedelta(months=old.tenure_months)
-
-    db.add(FixedDeposit(
-        name=f"{old.name} (Renewed)",
-        principal=old.principal,
-        rate=old.rate,
-        tenure_months=old.tenure_months,
-        deposit_date=new_dep,
-        maturity_date=new_mat,
-        status="active"
-    ))
-    db.commit()
-
-def fetch_assets_for_pdf(db):
-    # ---------- METALS ----------
-    gold_price = get_price(db, "gold_price", 0.0)
-    silver_price = get_price(db, "silver_price", 0.0)
-
-    metals_df = pd.read_sql(
-        "SELECT metal_type, weight_grams FROM metal_assets",
-        engine
-    )
-
-    gold_df = metals_df[metals_df["metal_type"] == "Gold"].copy()
-    silver_df = metals_df[metals_df["metal_type"] == "Silver"].copy()
-
-    gold_df["Value (₹)"] = (gold_df["weight_grams"] * gold_price).round(2)
-    silver_df["Value (₹)"] = (silver_df["weight_grams"] * silver_price).round(2)
-
-    gold_total = gold_df["Value (₹)"].sum()
-    silver_total = silver_df["Value (₹)"].sum()
-
-    # ---------- LAND ----------
-    land_df = pd.read_sql(
-        "SELECT location, area_size FROM land_assets",
-        engine
-    )
-
-    if not land_df.empty:
-        land_df["Price ₹/sqft"] = land_df["location"].apply(
-            lambda loc: get_price(db, f"land:{loc}", 0.0)
-        )
-        land_df["Value (₹)"] = land_df["area_size"] * land_df["Price ₹/sqft"]
-        land_total = land_df["Value (₹)"].sum()
-    else:
-        land_total = 0.0
-
-    # ---------- FIXED DEPOSITS ----------
-    fd_df = pd.read_sql(
-        "SELECT name, principal, rate, tenure_months, deposit_date FROM fixed_deposits",
-        engine
-    )
-
-    today = date.today()
-    if not fd_df.empty:
-        fd_df["Current Value (₹)"] = fd_df.apply(
-            lambda r: round(
-                r["principal"]
-                * ((1 + r["rate"] / 100) **
-                   ((today - pd.to_datetime(r["deposit_date"]).date()).days / 365)),
-                2
-            ),
-            axis=1
-        )
-        fd_total = fd_df["Current Value (₹)"].sum()
-    else:
-        fd_total = 0.0
-
-    grand_total = gold_total + silver_total + land_total + fd_total
-
-    return {
-        "gold_df": gold_df,
-        "silver_df": silver_df,
-        "gold_price": gold_price,
-        "silver_price": silver_price,
-        "gold_total": gold_total,
-        "silver_total": silver_total,
-        "land_df": land_df,
-        "land_total": land_total,
-        "fd_df": fd_df,
-        "fd_total": fd_total,
-        "grand_total": grand_total,
-    }
-
-def generate_assets_pdf(data, sections):
-    buffer = BytesIO()
+def generate_event_pdf_black(event_name, start_label, end_label, df):
+    buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
         pagesize=A4,
-        leftMargin=30,
-        rightMargin=20,
-        topMargin=30,
-        bottomMargin=30
+        rightMargin=28,
+        leftMargin=28,
+        topMargin=28,
+        bottomMargin=28
     )
 
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(
-        name="BlackNormal",
+    title_style = ParagraphStyle(
+        name="EventTitleBlack",
+        parent=styles["Title"],
         fontName="DejaVu",
-        fontSize=10,
-        textColor=colors.white
-    ))
-    styles.add(ParagraphStyle(
-        name="BlackTitle",
-        fontName="DejaVu",
-        fontSize=20,
-        textColor=colors.white,
-        spaceAfter=14
-    ))
-    styles.add(ParagraphStyle(
-        name="BlackHeading",
-        fontName="DejaVu",
-        fontSize=14,
+        fontSize=18,
         textColor=colors.white,
         spaceAfter=10
-    ))
+    )
+    meta_style = ParagraphStyle(
+        name="EventMetaBlack",
+        parent=styles["Normal"],
+        fontName="DejaVu",
+        fontSize=10,
+        textColor=colors.white,
+        leading=14
+    )
+
+    total = float(df["amount"].sum()) if not df.empty else 0.0
 
     story = []
-    story.append(Paragraph("Assets Valuation Report", styles["BlackTitle"]))
-    story.append(Paragraph(
-        f"Generated on: {date.today()}",
-        styles["BlackNormal"]
-    ))
-    story.append(Spacer(1, 14))
+    story.append(Paragraph(f"Event Report — {event_name}", title_style))
+    story.append(Paragraph(f"Date range: {start_label} → {end_label}", meta_style))
+    story.append(Paragraph(f"Total spend: ₹ {total:,.2f}", meta_style))
+    story.append(Spacer(1, 12))
 
-    GRAND_TOTAL = 0.0
+    table_rows = [["Date", "Category", "Subcategory", "Amount (₹)"]]
+    for _, row in df.iterrows():
+        table_rows.append([
+            row["date"],
+            row["category"],
+            row["subcategory"],
+            f"{float(row['amount']):,.2f}"
+        ])
 
-    # ================= METALS =================
-    if "Metals" in sections:
-        story.append(Paragraph("<b>Metal Assets</b>", styles["BlackHeading"]))
-        story.append(Paragraph(
-            f"Gold ₹/g: {data['gold_price']} | Silver ₹/g: {data['silver_price']}",
-            styles["BlackNormal"]
-        ))
-        story.append(Spacer(1, 8))
+    col_widths = [
+        doc.width * 0.22,
+        doc.width * 0.28,
+        doc.width * 0.32,
+        doc.width * 0.18
+    ]
+    table = Table(table_rows, colWidths=col_widths, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "DejaVu"),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.black),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.black),
+        ("TEXTCOLOR", (0, 1), (-1, -1), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ALIGN", (0, 0), (-2, -1), "LEFT"),
+        ("ALIGN", (-1, 1), (-1, -1), "RIGHT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 10))
 
-        def metal_table(df, title, total):
-            tbl = [[title, "Value (₹)"]] + df[["weight_grams", "Value (₹)"]].values.tolist()
-            tbl.append(["TOTAL", f"{total:,.2f}"])
-            t = Table(tbl, colWidths=[100, 100])
-            t.setStyle(TableStyle([
-                ("FONT", (0,0), (-1,-1), "DejaVu"),
-                ("BACKGROUND", (0,0), (-1,-1), colors.black),
-                ("TEXTCOLOR", (0,0), (-1,-1), colors.white),
-                ("GRID", (0,0), (-1,-1), 0.5, colors.white),
-                ("ALIGN", (0,0), (-1,-1), "CENTER"),
-            ]))
-            return t
-
-        gold_tbl = metal_table(
-            data["gold_df"], "Gold (grams)", data["gold_total"]
-        )
-        silver_tbl = metal_table(
-            data["silver_df"], "Silver (grams)", data["silver_total"]
-        )
-
-        wrapper = Table([[gold_tbl, silver_tbl]], colWidths=[250, 250])
-        story.append(wrapper)
-        story.append(Spacer(1, 14))
-
-        GRAND_TOTAL += data["gold_total"] + data["silver_total"]
-
-    # ================= LAND =================
-    if "Land" in sections and not data["land_df"].empty:
-        story.append(Paragraph("<b>Land Assets</b>", styles["BlackHeading"]))
-        tbl = [list(data["land_df"].columns)] + data["land_df"].values.tolist()
-        tbl.append(["", "TOTAL", "", f"{data['land_total']:,.2f}"])
-        t = Table(tbl)
-        t.setStyle(TableStyle([
-            ("FONT", (0,0), (-1,-1), "DejaVu"),
-            ("BACKGROUND", (0,0), (-1,-1), colors.black),
-            ("TEXTCOLOR", (0,0), (-1,-1), colors.white),
-            ("GRID", (0,0), (-1,-1), 0.5, colors.white),
-        ]))
-        story.append(t)
-        story.append(Spacer(1, 14))
-
-        GRAND_TOTAL += data["land_total"]
-
-    # ================= FIXED DEPOSITS =================
-    if "Fixed Deposits" in sections and not data["fd_df"].empty:
-        story.append(Paragraph("<b>Fixed Deposits</b>", styles["BlackHeading"]))
-        tbl = [list(data["fd_df"].columns)] + data["fd_df"].values.tolist()
-        tbl.append(["TOTAL", "", "", "", f"{data['fd_total']:,.2f}"])
-        t = Table(tbl)
-        t.setStyle(TableStyle([
-            ("FONT", (0,0), (-1,-1), "DejaVu"),
-            ("BACKGROUND", (0,0), (-1,-1), colors.black),
-            ("TEXTCOLOR", (0,0), (-1,-1), colors.white),
-            ("GRID", (0,0), (-1,-1), 0.5, colors.white),
-        ]))
-        story.append(t)
-
-        GRAND_TOTAL += data["fd_total"]
-
-    # ================= GRAND TOTAL =================
-    story.append(Spacer(1, 24))
-    story.append(Paragraph(
-        "<b>GRAND TOTAL ASSETS VALUE</b>",
-        styles["BlackHeading"]
-    ))
-    story.append(Paragraph(
-        f"₹ {GRAND_TOTAL:,.2f}",
-        ParagraphStyle(
-            name="GrandTotalValue",
-            fontName="DejaVu",
-            fontSize=18,
-            textColor=colors.white
-        )
-    ))
+    total_table = Table(
+        [["TOTAL", f"₹ {total:,.2f}"]],
+        colWidths=[doc.width - col_widths[-1], col_widths[-1]],
+        hAlign="LEFT"
+    )
+    total_table.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "DejaVu"),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.white),
+        ("LINEABOVE", (0, 0), (-1, 0), 0.6, colors.white),
+        ("ALIGN", (0, 0), (0, 0), "LEFT"),
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(total_table)
 
     def black_bg(canvas, doc):
         canvas.saveState()
@@ -1320,215 +1413,5 @@ def generate_assets_pdf(data, sections):
         canvas.restoreState()
 
     doc.build(story, onFirstPage=black_bg, onLaterPages=black_bg)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-# =============
-# APPLIANCES FUNCTIONS
-# =============
-def create_appliance(db, name, price, purchase_date, warranty_expiry, images):
-    appliance = Appliance(
-        name=name,
-        price=price,
-        purchase_date=purchase_date,
-        warranty_expiry=warranty_expiry,
-    )
-    db.add(appliance)
-    db.commit()
-    db.refresh(appliance)
-
-    if images:
-        for img in images:
-            safe = f"{int(time.time())}_{img.name}"
-            path = os.path.join(APPLIANCE_IMG_DIR, safe)
-            with open(path, "wb") as f:
-                f.write(img.getbuffer())
-
-            db.add(ApplianceImage(
-                appliance_id=appliance.id,
-                image_path=path
-            ))
-
-    db.commit()
-
-def fetch_appliances(db):
-    return (
-        db.query(Appliance)
-        .options(joinedload(Appliance.images))
-        .order_by(Appliance.purchase_date.desc())
-        .all()
-    )
-
-def update_appliance(
-    db,
-    appliance_id,
-    name,
-    price,
-    purchase_date,
-    warranty_expiry,
-    new_images
-):
-    appliance = db.get(Appliance, appliance_id)
-    if not appliance:
-        return
-
-    appliance.name = name
-    appliance.price = price
-    appliance.purchase_date = purchase_date
-    appliance.warranty_expiry = warranty_expiry
-
-    if new_images:
-        for img in new_images:
-            safe = f"{int(time.time())}_{img.name}"
-            path = os.path.join(APPLIANCE_IMG_DIR, safe)
-            with open(path, "wb") as f:
-                f.write(img.getbuffer())
-
-            db.add(ApplianceImage(
-                appliance_id=appliance.id,
-                image_path=path
-            ))
-
-    db.commit()
-
-def delete_appliance(db, appliance_id):
-    appliance = db.get(Appliance, appliance_id)
-    if not appliance:
-        return
-
-    for img in appliance.images:
-        if os.path.exists(img.image_path):
-            os.remove(img.image_path)
-
-    db.delete(appliance)
-    db.commit()
-
-def appliance_value_distribution(appliances):
-    return pd.DataFrame([{
-        "Appliance": a.name,
-        "Price": float(a.price)
-    } for a in appliances])
-
-
-def appliance_year_distribution(appliances):
-    df = pd.DataFrame([{
-        "Year": a.purchase_date.year
-    } for a in appliances])
-
-    return df.value_counts().reset_index(
-        name="Count"
-    ).rename(columns={"Year": "Year"})
-
-def fetch_appliances_for_pdf(db):
-    return (
-        db.query(Appliance)
-        .options(joinedload(Appliance.images))
-        .order_by(Appliance.purchase_date.desc())
-        .all()
-    )
-
-def generate_appliances_pdf(appliances):
-    buffer = BytesIO()
-
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        leftMargin=30,
-        rightMargin=30,
-        topMargin=30,
-        bottomMargin=30
-    )
-
-    styles = getSampleStyleSheet()
-
-    styles.add(ParagraphStyle(
-        name="WhiteTitle",
-        fontName="DejaVu",
-        fontSize=20,
-        textColor=colors.white,
-        spaceAfter=14
-    ))
-    styles.add(ParagraphStyle(
-        name="WhiteNormal",
-        fontName="DejaVu",
-        fontSize=10,
-        textColor=colors.white,
-        spaceAfter=6
-    ))
-    styles.add(ParagraphStyle(
-        name="WhiteHeading",
-        fontName="DejaVu",
-        fontSize=14,
-        textColor=colors.white,
-        spaceAfter=10
-    ))
-
-    story = []
-
-    story.append(Paragraph("Appliances Report", styles["WhiteTitle"]))
-    story.append(Paragraph(
-        f"Generated on: {date.today()}",
-        styles["WhiteNormal"]
-    ))
-    story.append(Spacer(1, 12))
-
-    if not appliances:
-        story.append(Paragraph(
-            "No appliance data available.",
-            styles["WhiteNormal"]
-        ))
-    else:
-        table_data = [
-            ["Name", "Price (₹)", "Purchase Date", "Warranty Expiry"]
-        ]
-
-        for ap in appliances:
-            table_data.append([
-                ap.name,
-                f"{ap.price:,.2f}",
-                ap.purchase_date.strftime("%Y-%m-%d"),
-                ap.warranty_expiry.strftime("%Y-%m-%d")
-                if ap.warranty_expiry else "—"
-            ])
-
-        table = Table(
-            table_data,
-            colWidths=[160, 90, 100, 100],
-            hAlign="LEFT"
-        )
-
-        table.setStyle(TableStyle([
-            ("FONT", (0,0), (-1,-1), "DejaVu"),
-            ("BACKGROUND", (0,0), (-1,0), colors.black),
-            ("BACKGROUND", (0,1), (-1,-1), colors.black),
-            ("TEXTCOLOR", (0,0), (-1,-1), colors.white),
-            ("GRID", (0,0), (-1,-1), 0.5, colors.white),
-            ("ALIGN", (1,1), (-1,-1), "CENTER"),
-            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-            ("TOPPADDING", (0,0), (-1,-1), 6),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-        ]))
-
-        story.append(table)
-
-    def black_page(canvas, doc):
-        canvas.saveState()
-        canvas.setFillColor(colors.black)
-        canvas.rect(
-            0, 0,
-            doc.pagesize[0],
-            doc.pagesize[1],
-            fill=1,
-            stroke=0
-        )
-        canvas.restoreState()
-
-    doc.build(
-        story,
-        onFirstPage=black_page,
-        onLaterPages=black_page
-    )
-
     buffer.seek(0)
     return buffer.getvalue()

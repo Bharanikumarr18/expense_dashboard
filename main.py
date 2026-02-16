@@ -17,6 +17,7 @@ import io
 from io import BytesIO
 import json
 import re
+from difflib import SequenceMatcher
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
@@ -37,25 +38,36 @@ import subprocess
 import shutil
 import smtplib
 from email.message import EmailMessage
+import sqlite3
+import tempfile
+import zipfile
+import pytesseract
+from PIL import Image
+import cv2
+import numpy as np
 
-
+def get_config(key, default=None):
+    value = os.getenv(key)
+    if value is None or value == "":
+        return st.secrets.get(key, default)
+    return value
 
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
 
 # ==============
 # SESSION STATE
 # ==============
-if "open_asset_inputs" not in st.session_state: 
-    st.session_state.open_asset_inputs = False
+def init_session_state():
+    defaults = {
+        "open_asset_inputs": False,
+        "show_weekly_trend": True,
+        "show_inv_delete_manager": False,
+        "data_refresh": 0
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
-# =======================
-# WEEKLY TREND VISIBILITY
-# =======================
-if "show_weekly_trend" not in st.session_state:
-    st.session_state.show_weekly_trend = True
-
-if "show_inv_delete_manager" not in st.session_state:
-    st.session_state.show_inv_delete_manager = False
+init_session_state()
 
 # ==============
 # FLASH MESSAGE
@@ -67,22 +79,38 @@ def flash(message, kind="success"):
         "msg": message,
         "type": kind
     })
+
 # ==============
 # DB SETUP
 # ==============
 st.set_page_config(
     page_title="Tracker",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # ==============
 # DATABASE MODELS
 # ==============
-DATABASE_URL = st.secrets.get(
+DATABASE_URL = get_config(
     "DATABASE_URL",
     "sqlite:///expense.db"
 )
+
+# Normalize sqlite path to avoid FileNotFoundError on missing directories.
+if DATABASE_URL.startswith("sqlite"):
+    db_path = None
+    if DATABASE_URL.startswith("sqlite:///"):
+        db_path = DATABASE_URL.replace("sqlite:///", "")
+    elif DATABASE_URL.startswith("sqlite:////"):
+        db_path = DATABASE_URL.replace("sqlite:////", "/")
+
+    if db_path:
+        if not os.path.isabs(db_path):
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            db_path = os.path.abspath(os.path.join(base_dir, db_path))
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        DATABASE_URL = f"sqlite:///{db_path}"
 
 engine_args = {}
 if DATABASE_URL.startswith("sqlite"):
@@ -132,6 +160,10 @@ class Expense(Base):                                                            
     subcategory_id = Column(Integer, ForeignKey("subcategories.id"), index=True) # subcategory id
     date = Column(Date, nullable=False, index=True)                              # date of expense        
     amount = Column(Float, nullable=False)                                       # expense amount
+    travel = Column(Integer, default=0)                                          # 1 = travel expense
+    trip_name = Column(String, nullable=True)                                    # travel trip name
+    trip_start = Column(Date, nullable=True)                                     # trip start date
+    trip_end = Column(Date, nullable=True)                                       # trip end date
 # ==============
 # INCOME MODELS
 # ==============
@@ -192,6 +224,7 @@ class FixedDeposit(Base):                             # fixed deposit assets
     principal = Column(Float, nullable=False)         # amount deposited
     rate = Column(Float, nullable=False)              # annual %
     tenure_months = Column(Integer, nullable=False)   # tenure in months      
+    tenure_days = Column(Integer, nullable=True)      # tenure in days
     deposit_date = Column(Date, nullable=False)       # date of deposit
     maturity_date = Column(Date, nullable=False)      # date of maturity
     status = Column(String, default="active")         # active | matured
@@ -241,35 +274,114 @@ class InvestmentEntry(Base):
 Base.metadata.create_all(bind=engine)
 
 # ==============
-# WEEKLY GDRIVE BACKUP (SUNDAYS)
+# DB MIGRATIONS
 # ==============
-GDRIVE_BACKUP_DIR = "/run/user/1000/gvfs/google-drive:host=gmail.com,user=bharanikumarr18/0AD1AeGLeY7L2Uk9PVA/1N9g1kGDrxiZpVq73wtodNM_ithFp5sl1"
-BACKUP_FILENAME = "expense_backup.db"
-BACKUP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_gdrive_backup.txt")
-
-# Handle weekly Google Drive backup.
-def weekly_gdrive_backup():
-    if st.session_state.get("weekly_backup_checked"):
-        return
-    st.session_state.weekly_backup_checked = True
-
-    today = date.today()
-    if today.weekday() != 6:  # Sunday
-        return
-
+def migrate_expense_travel():
     try:
-        if os.path.exists(BACKUP_STATE_FILE):
-            last = open(BACKUP_STATE_FILE, "r").read().strip()
-            if last == today.isoformat():
-                return
+        with engine.connect() as conn:
+            cols = conn.execute(text("PRAGMA table_info(expenses)")).fetchall()
+            col_names = {c[1] for c in cols}
+            if "travel" not in col_names:
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN travel INTEGER DEFAULT 0"))
+            if "trip_name" not in col_names:
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN trip_name VARCHAR"))
+            if "trip_start" not in col_names:
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN trip_start DATE"))
+            if "trip_end" not in col_names:
+                conn.execute(text("ALTER TABLE expenses ADD COLUMN trip_end DATE"))
     except Exception:
         pass
 
-    if not os.path.isdir(GDRIVE_BACKUP_DIR):
-        if not st.session_state.get("weekly_backup_warned"):
-            st.session_state.weekly_backup_warned = True
-            st.warning("Weekly backup skipped: Google Drive folder not available.")
-        return
+migrate_expense_travel()
+
+
+def migrate_fixed_deposit_tenure_days():
+    try:
+        with engine.begin() as conn:
+            cols = conn.execute(text("PRAGMA table_info(fixed_deposits)")).fetchall()
+            col_names = {c[1] for c in cols}
+            if "tenure_days" not in col_names:
+                conn.execute(text("ALTER TABLE fixed_deposits ADD COLUMN tenure_days INTEGER"))
+    except Exception:
+        pass
+
+
+migrate_fixed_deposit_tenure_days()
+
+# ==============
+# WEEKLY BACKUP (SUNDAYS)
+# ==============
+GDRIVE_BACKUP_DIR = get_config(
+    "GDRIVE_BACKUP_DIR",
+    "/run/user/1000/gvfs/google-drive:host=gmail.com,user=bharanikumarr18/0AD1AeGLeY7L2Uk9PVA/1N9g1kGDrxiZpVq73wtodNM_ithFp5sl1"
+)
+LOCAL_IMPORT_DIR = os.path.expanduser(
+    get_config("LOCAL_IMPORT_DIR", "~/Documents/Tracker Imports")
+)
+try:
+    os.makedirs(LOCAL_IMPORT_DIR, exist_ok=True)
+except Exception:
+    pass
+BACKUP_FILENAME = "expense.db"
+BACKUP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_gdrive_backup.txt")
+BACKUP_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_gdrive_backup_meta.json")
+DB_MAINT_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_db_maintenance.txt")
+DAY_MERGE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_day_subcategory_merge.txt")
+SECRETS_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".streamlit", "secrets.toml")
+
+def read_state_value(path):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def write_state_value(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+    except Exception:
+        pass
+
+
+def read_backup_meta():
+    try:
+        with open(BACKUP_META_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_backup_meta(meta):
+    try:
+        with open(BACKUP_META_FILE, "w") as f:
+            json.dump(meta, f)
+    except Exception:
+        pass
+
+
+def create_sqlite_backup(src_path):
+    try:
+        tmp = tempfile.NamedTemporaryFile(prefix="tracker_backup_", suffix=".db", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        with sqlite3.connect(src_path) as src, sqlite3.connect(tmp_path) as dst:
+            src.backup(dst)
+        return tmp_path, None
+    except Exception as exc:
+        try:
+            if "tmp_path" in locals() and tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+        return None, str(exc)
+
+
+# Resolve the SQLite db path from DATABASE_URL.
+def resolve_db_path():
+    if not DATABASE_URL.startswith("sqlite"):
+        return None, "Database URL is not SQLite; file backup is not supported."
 
     db_path = "expense.db"
     if DATABASE_URL.startswith("sqlite:///"):
@@ -281,16 +393,415 @@ def weekly_gdrive_backup():
         base_dir = os.path.dirname(os.path.abspath(__file__))
         db_path = os.path.abspath(os.path.join(base_dir, db_path))
 
-    if not os.path.exists(db_path):
-        if not st.session_state.get("weekly_backup_warned"):
-            st.session_state.weekly_backup_warned = True
-            st.warning("Weekly backup skipped: expense.db not found.")
-        return
+    return db_path, None
+
+
+def backup_db_to_gdrive():
+    if not os.path.isdir(GDRIVE_BACKUP_DIR):
+        return False, "Google Drive folder not available."
+
+    db_path, err = resolve_db_path()
+    if err:
+        return False, err
+
+    if not db_path or not os.path.exists(db_path):
+        return False, "expense.db not found."
+
+    tmp_path = None
+    src_path = db_path
+    tmp_path, tmp_err = create_sqlite_backup(db_path)
+    if tmp_path:
+        src_path = tmp_path
 
     dest = os.path.join(GDRIVE_BACKUP_DIR, BACKUP_FILENAME)
-    shutil.copy2(db_path, dest)
-    with open(BACKUP_STATE_FILE, "w") as f:
-        f.write(today.isoformat())
+    last_exc = None
+    try:
+        shutil.copy2(src_path, dest)
+    except OSError:
+        # GVFS often fails on copystat; fallback to plain copy.
+        try:
+            shutil.copyfile(src_path, dest)
+        except Exception as exc:
+            last_exc = exc
+
+    if last_exc:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        return False, f"Backup failed: {last_exc}"
+
+    try:
+        expected_size = os.path.getsize(src_path)
+        dest_size = os.path.getsize(dest)
+        if dest_size <= 0 or dest_size != expected_size:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            return False, "Backup verification failed: size mismatch."
+    except Exception as exc:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        return False, f"Backup verification failed: {exc}"
+
+    if tmp_path and os.path.exists(tmp_path):
+        os.unlink(tmp_path)
+
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    write_state_value(BACKUP_STATE_FILE, ts)
+    write_backup_meta({
+        "timestamp": ts,
+        "dest": dest,
+        "size": dest_size,
+        "source": db_path
+    })
+
+    return True, "Database backed up to Google Drive."
+
+
+def verify_gdrive_backup():
+    meta = read_backup_meta() or {}
+    dest = meta.get("dest") or os.path.join(GDRIVE_BACKUP_DIR, BACKUP_FILENAME)
+    if not os.path.exists(dest):
+        return False, "Backup file not found in Google Drive."
+
+    try:
+        dest_size = os.path.getsize(dest)
+    except Exception as exc:
+        return False, f"Could not read backup file: {exc}"
+
+    if dest_size <= 0:
+        return False, "Backup verification failed: empty file."
+
+    expected_size = meta.get("size")
+    if expected_size is None:
+        return True, "Backup exists (no metadata to verify size)."
+
+    if dest_size != expected_size:
+        return False, "Backup verification failed: size mismatch."
+
+    return True, "Backup verified."
+
+
+def run_db_maintenance():
+    db_path, err = resolve_db_path()
+    if err:
+        return False, err
+    if not db_path or not os.path.exists(db_path):
+        return False, "expense.db not found."
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("PRAGMA optimize;")
+            conn.execute("VACUUM;")
+            conn.execute("ANALYZE;")
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        write_state_value(DB_MAINT_STATE_FILE, ts)
+        return True, "Database maintenance completed."
+    except Exception as exc:
+        return False, f"Maintenance failed: {exc}"
+
+
+def format_state_value(value):
+    if not value:
+        return "Never"
+    try:
+        if "T" in value:
+            dt = datetime.datetime.fromisoformat(value)
+            return dt.strftime("%d %b %Y %H:%M")
+        dt = datetime.datetime.strptime(value, "%Y-%m-%d")
+        return dt.strftime("%d %b %Y")
+    except Exception:
+        return value
+
+
+def format_bytes(num):
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(num)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+
+
+def get_db_size():
+    db_path, err = resolve_db_path()
+    if err:
+        return None, err
+    if not db_path or not os.path.exists(db_path):
+        return None, "expense.db not found."
+    try:
+        return os.path.getsize(db_path), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _find_first_matching_expense(
+    db,
+    entry_date,
+    category_id,
+    subcategory_id,
+    travel,
+    trip_name=None,
+    trip_start=None,
+    trip_end=None
+):
+    q = (
+        db.query(Expense)
+        .filter(Expense.date == entry_date)
+        .filter(Expense.category_id == category_id)
+        .filter(Expense.subcategory_id == subcategory_id)
+        .filter(Expense.travel == int(travel))
+    )
+    if int(travel) == 1:
+        q = (
+            q.filter(Expense.trip_name == trip_name)
+            .filter(Expense.trip_start == trip_start)
+            .filter(Expense.trip_end == trip_end)
+        )
+    else:
+        q = (
+            q.filter(Expense.trip_name.is_(None))
+            .filter(Expense.trip_start.is_(None))
+            .filter(Expense.trip_end.is_(None))
+        )
+    return q.order_by(Expense.id.asc()).first()
+
+
+def _add_or_merge_expense(
+    db,
+    category_id,
+    subcategory_id,
+    entry_date,
+    amount,
+    travel=0,
+    trip_name=None,
+    trip_start=None,
+    trip_end=None
+):
+    existing = _find_first_matching_expense(
+        db=db,
+        entry_date=entry_date,
+        category_id=category_id,
+        subcategory_id=subcategory_id,
+        travel=travel,
+        trip_name=trip_name,
+        trip_start=trip_start,
+        trip_end=trip_end
+    )
+    if existing:
+        existing.amount = float(existing.amount) + float(amount)
+        return "merged", existing
+
+    obj = Expense(
+        category_id=category_id,
+        subcategory_id=subcategory_id,
+        date=entry_date,
+        amount=float(amount),
+        travel=int(travel),
+        trip_name=trip_name if int(travel) == 1 else None,
+        trip_start=trip_start if int(travel) == 1 else None,
+        trip_end=trip_end if int(travel) == 1 else None
+    )
+    db.add(obj)
+    return "inserted", obj
+
+
+def _create_local_db_snapshot(prefix="expense_before_day_merge"):
+    db_path, err = resolve_db_path()
+    if err:
+        return None, err
+    if not db_path or not os.path.exists(db_path):
+        return None, "expense.db not found."
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = f"{prefix}_{ts}.db"
+    backup_path = os.path.join(os.path.dirname(db_path), backup_name)
+    try:
+        shutil.copy2(db_path, backup_path)
+    except Exception as exc:
+        return None, f"Could not create safety backup: {exc}"
+    return backup_path, None
+
+
+def merge_same_day_subcategory_entries(days=None):
+    try:
+        backup_path, backup_err = _create_local_db_snapshot()
+        if backup_err:
+            return False, backup_err, 0, 0, None
+
+        with SessionLocal() as db:
+            q = db.query(Expense).order_by(Expense.id.asc())
+            if days is not None:
+                cutoff = date.today() - timedelta(days=int(days))
+                q = q.filter(Expense.date >= cutoff)
+            rows = q.all()
+
+            grouped = {}
+            for exp in rows:
+                travel_flag = int(exp.travel or 0)
+                trip_name = _clean_import_text(exp.trip_name) if travel_flag else None
+                trip_start = exp.trip_start if travel_flag else None
+                trip_end = exp.trip_end if travel_flag else None
+                if trip_start and not trip_end:
+                    trip_end = trip_start
+                if trip_end and not trip_start:
+                    trip_start = trip_end
+
+                key = (
+                    exp.date,
+                    int(exp.category_id),
+                    int(exp.subcategory_id),
+                    travel_flag,
+                    trip_name or None,
+                    trip_start,
+                    trip_end,
+                )
+                grouped.setdefault(key, []).append(exp)
+
+            merged_rows = 0
+            affected_groups = 0
+            for items in grouped.values():
+                if len(items) <= 1:
+                    continue
+                keeper = items[0]
+                total_amt = sum(float(i.amount or 0.0) for i in items)
+                keeper.amount = float(total_amt)
+                for extra in items[1:]:
+                    db.delete(extra)
+                    merged_rows += 1
+                affected_groups += 1
+
+            if merged_rows > 0:
+                db.commit()
+
+        write_state_value(DAY_MERGE_STATE_FILE, datetime.datetime.now().isoformat(timespec="seconds"))
+        return True, "Merge completed.", affected_groups, merged_rows, backup_path
+    except Exception as exc:
+        return False, f"Merge failed: {exc}", 0, 0, None
+
+
+def run_db_integrity_check():
+    db_path, err = resolve_db_path()
+    if err:
+        return False, err
+    if not db_path or not os.path.exists(db_path):
+        return False, "expense.db not found."
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute("PRAGMA integrity_check;").fetchone()
+        result = str(row[0]).strip() if row and row[0] is not None else ""
+        if result.lower() == "ok":
+            return True, "Integrity check passed."
+        return False, f"Integrity check failed: {result or 'unknown'}"
+    except Exception as exc:
+        return False, f"Integrity check failed: {exc}"
+
+
+def _parse_state_datetime(value):
+    if not value:
+        return None
+    try:
+        if "T" in value:
+            return datetime.datetime.fromisoformat(value)
+        return datetime.datetime.strptime(value, "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _build_safety_snapshot_zip():
+    tables = [
+        "expenses",
+        "categories",
+        "subcategories",
+        "income",
+        "income_categories",
+        "income_subcategories",
+    ]
+
+    out = BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for table in tables:
+            try:
+                df = pd.read_sql_query(f"SELECT * FROM {table}", engine)
+            except Exception:
+                continue
+            zf.writestr(f"{table}.csv", df.to_csv(index=False))
+
+        if os.path.exists("requirements.txt"):
+            try:
+                with open("requirements.txt", "r", encoding="utf-8") as f:
+                    zf.writestr("requirements.txt", f.read())
+            except Exception:
+                pass
+
+    out.seek(0)
+    return out.getvalue()
+
+
+def render_system_status_panel():
+    with st.sidebar.expander("🛠 System Status", expanded=False):
+        st.write(f"Last backup: {format_state_value(read_state_value(BACKUP_STATE_FILE))}")
+        st.write(f"Last weekly email: {format_state_value(read_state_value(WEEKLY_EMAIL_STATE_FILE))}")
+        st.write(f"Last monthly email: {format_state_value(read_state_value(MONTHLY_EMAIL_STATE_FILE))}")
+        st.write(f"Last DB maintenance: {format_state_value(read_state_value(DB_MAINT_STATE_FILE))}")
+        st.write(f"Last day+subcategory merge: {format_state_value(read_state_value(DAY_MERGE_STATE_FILE))}")
+
+        db_size, size_err = get_db_size()
+        if db_size is not None:
+            st.write(f"DB size: {format_bytes(db_size)}")
+        else:
+            st.write(f"DB size: {size_err}")
+
+        if os.path.exists(SECRETS_FILE_PATH):
+            st.caption("Secrets file detected in project. Consider moving credentials to environment variables.")
+
+        if st.button("Verify Backup", key="verify_backup_btn"):
+            ok, msg = verify_gdrive_backup()
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        if st.button("Run DB Maintenance", key="run_db_maint_btn"):
+            with st.spinner("Running DB maintenance..."):
+                ok, msg = run_db_maintenance()
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        if st.button("Merge All Past Entries", key="merge_day_subcategory_btn"):
+            with st.spinner("Merging same day + subcategory entries across all history..."):
+                ok, msg, groups, rows, backup_path = merge_same_day_subcategory_entries(days=None)
+            if ok:
+                st.success(f"{msg} Groups merged: {groups}, rows removed: {rows}.")
+                if backup_path:
+                    st.caption(f"Safety backup: {backup_path}")
+                st.session_state.data_refresh += 1
+            else:
+                st.error(msg)
+
+
+# Handle weekly Google Drive backup.
+def weekly_gdrive_backup():
+    if st.session_state.get("weekly_backup_checked"):
+        return
+    st.session_state.weekly_backup_checked = True
+
+    today = date.today()
+    if today.weekday() != 6:  # Sunday
+        return
+
+    last = read_state_value(BACKUP_STATE_FILE)
+    if last:
+        last_date = last.split("T")[0]
+        if last_date == today.isoformat():
+            return
+
+    ok, msg = backup_db_to_gdrive()
+    if not ok:
+        if not st.session_state.get("weekly_backup_warned"):
+            st.session_state.weekly_backup_warned = True
+            st.warning(f"Weekly backup skipped: {msg}")
+        return
+
     flash("Weekly backup saved to Google Drive.", "info")
 
 weekly_gdrive_backup()
@@ -298,11 +809,11 @@ weekly_gdrive_backup()
 # ==============
 # WEEKLY EMAIL REPORT (SUNDAYS)
 # ==============
-SMTP_HOST = st.secrets.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(st.secrets.get("SMTP_PORT", 587))
-SMTP_USER = st.secrets.get("SMTP_USER", "")
-SMTP_PASS = st.secrets.get("SMTP_PASS", "")
-SMTP_TO = st.secrets.get("SMTP_TO", "bharanikumarr18@gmail.com")
+SMTP_HOST = get_config("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(get_config("SMTP_PORT", "587"))
+SMTP_USER = get_config("SMTP_USER", "")
+SMTP_PASS = get_config("SMTP_PASS", "")
+SMTP_TO = get_config("SMTP_TO", "bharanikumarr18@gmail.com")
 WEEKLY_EMAIL_STATE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     ".last_weekly_email.txt"
@@ -328,7 +839,7 @@ def generate_weekly_expense_pdf(start_date, end_date):
             .order_by(Expense.date.desc(), Expense.id.desc())
             .all()
         )
-
+                                                                                                                                                            
     df = pd.DataFrame(rows, columns=["date", "category", "subcategory", "amount"])
     total = float(df["amount"].sum()) if not df.empty else 0.0
     count = int(len(df))
@@ -917,8 +1428,6 @@ send_monthly_email_report()
 # ==============
 # CREATE TABLES
 # ==============
-if "data_refresh" not in st.session_state:
-    st.session_state.data_refresh = 0
 # Load expense data.
 @st.cache_data(show_spinner=False)
 def load_expense_data(refresh_key):
@@ -938,24 +1447,1203 @@ def load_expense_data(refresh_key):
             columns=["date", "amount", "category", "subcategory"]
         )
 
+# Load income data.
+@st.cache_data(show_spinner=False)
+def load_income_data(refresh_key):
+    with SessionLocal() as db:
+        q = (
+            db.query(
+                Income.id,
+                Income.date,
+                Income.amount,
+                IncomeCategory.name.label("category"),
+                IncomeSubCategory.name.label("subcategory")
+            )
+            .join(IncomeCategory, Income.category_id == IncomeCategory.id)
+            .join(IncomeSubCategory, Income.subcategory_id == IncomeSubCategory.id)
+            .order_by(Income.date.desc(), Income.id.desc())
+        )
+        return pd.DataFrame(
+            q.all(),
+            columns=["id", "date", "amount", "category", "subcategory"]
+        )
+
+# Load events data.
+@st.cache_data(show_spinner=False)
+def load_events_data(refresh_key):
+    with SessionLocal() as db:
+        q = (
+            db.query(
+                Expense.date,
+                Category.name.label("category"),
+                SubCategory.name.label("subcategory"),
+                Expense.amount,
+                Expense.trip_name,
+                Expense.trip_start,
+                Expense.trip_end
+            )
+            .join(Category, Expense.category_id == Category.id)
+            .join(SubCategory, Expense.subcategory_id == SubCategory.id)
+            .filter(Expense.travel == 1)
+            .order_by(Expense.date.desc(), Expense.id.desc())
+        )
+        return pd.DataFrame(
+            q.all(),
+            columns=["date", "category", "subcategory", "amount", "trip_name", "trip_start", "trip_end"]
+        )
+
+# Load distinct event list (name + date range).
+@st.cache_data(show_spinner=False)
+def load_event_list(refresh_key):
+    with SessionLocal() as db:
+        return (
+            db.query(Expense.trip_name, Expense.trip_start, Expense.trip_end)
+            .filter(Expense.travel == 1)
+            .filter(Expense.trip_name.isnot(None))
+            .distinct()
+            .order_by(Expense.trip_start.desc(), Expense.trip_end.desc())
+            .all()
+        )
+
+
+# ======================
+# EXPENSE CSV IMPORT
+# ======================
+def _norm_lookup_text(value):
+    text_val = str(value or "").strip().lower()
+    return re.sub(r"[^a-z0-9]+", "", text_val)
+
+
+def _is_blank_import_value(value):
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    if isinstance(value, str):
+        txt = value.strip().lower()
+        if txt in {"", "nan", "none", "nat", "null"}:
+            return True
+    return False
+
+
+def _clean_import_text(value):
+    if _is_blank_import_value(value):
+        return ""
+    return str(value).strip()
+
+
+def _best_fuzzy_match(raw_value, candidates, min_score=0.78):
+    raw_norm = _norm_lookup_text(raw_value)
+    if not raw_norm or not candidates:
+        return None, 0.0
+
+    best_item = None
+    best_score = 0.0
+    for candidate in candidates:
+        score = SequenceMatcher(None, raw_norm, _norm_lookup_text(candidate)).ratio()
+        if score > best_score:
+            best_item = candidate
+            best_score = score
+
+    if best_item and best_score >= min_score:
+        return best_item, best_score
+    return None, best_score
+
+
+def _parse_import_date(value):
+    if value is None or str(value).strip() == "":
+        return None
+    parsed = pd.to_datetime(value, errors="coerce", dayfirst=False)
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def _parse_import_amount(value):
+    if value is None:
+        return None
+    txt = str(value).strip().replace(",", "")
+    amt = pd.to_numeric(txt, errors="coerce")
+    if pd.isna(amt):
+        return None
+    return float(amt)
+
+
+def _read_expense_import_file(file_obj_or_path, source_name=None):
+    file_name = str(source_name or getattr(file_obj_or_path, "name", "") or file_obj_or_path or "").lower()
+    try:
+        if file_name.endswith(".csv"):
+            return pd.read_csv(file_obj_or_path), None
+        if file_name.endswith(".xlsx"):
+            return pd.read_excel(file_obj_or_path, engine="openpyxl"), None
+        if file_name.endswith(".ods"):
+            try:
+                return pd.read_excel(file_obj_or_path, engine="odf"), None
+            except ImportError:
+                return None, "ODS import needs `odfpy`. Install with: `pip install odfpy`"
+        return None, "Unsupported file format. Use .csv, .xlsx, or .ods"
+    except Exception as exc:
+        return None, f"Could not read file: {exc}"
+
+
+def _list_local_import_files(folder_path):
+    if not folder_path:
+        return [], "Local import folder is not configured."
+    if not os.path.isdir(folder_path):
+        return [], f"Local import folder not found: {folder_path}"
+
+    rows = []
+    supported_ext = (".csv", ".xlsx", ".ods")
+    try:
+        with os.scandir(folder_path) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                if not entry.name.lower().endswith(supported_ext):
+                    continue
+                stat = entry.stat()
+                rows.append({
+                    "name": entry.name,
+                    "path": entry.path,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                })
+    except Exception as exc:
+        return [], f"Could not read local import folder: {exc}"
+
+    rows.sort(key=lambda x: x["mtime"], reverse=True)
+    return rows, None
+
+
+def _fmt_import_file_size(num_bytes):
+    size = float(num_bytes or 0)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size < 1024 or unit == "GB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return "0 B"
+
+
+def _get_expense_catalog(db):
+    cats = db.query(Category).order_by(Category.name.asc()).all()
+    subs = (
+        db.query(SubCategory.name, Category.name)
+        .join(Category, SubCategory.category_id == Category.id)
+        .order_by(Category.name.asc(), SubCategory.name.asc())
+        .all()
+    )
+
+    cat_to_subs = {c.name: [] for c in cats}
+    sub_to_cats = {}
+    for sub_name, cat_name in subs:
+        cat_to_subs.setdefault(cat_name, []).append(sub_name)
+        sub_to_cats.setdefault(sub_name, []).append(cat_name)
+
+    for cat_name in list(cat_to_subs.keys()):
+        cat_to_subs[cat_name] = sorted(set(cat_to_subs[cat_name]))
+    for sub_name in list(sub_to_cats.keys()):
+        sub_to_cats[sub_name] = sorted(set(sub_to_cats[sub_name]))
+
+    return cat_to_subs, sub_to_cats
+
+
+def _get_existing_events(db):
+    return (
+        db.query(Expense.trip_name, Expense.trip_start, Expense.trip_end)
+        .filter(Expense.travel == 1)
+        .filter(Expense.trip_name.isnot(None))
+        .distinct()
+        .order_by(Expense.trip_start.desc(), Expense.trip_end.desc())
+        .all()
+    )
+
+
+def _build_existing_event_maps(existing_events):
+    label_to_trip = {}
+    norm_label_to_trip = {}
+    name_norm_to_trips = {}
+
+    for trip_name, trip_start, trip_end in existing_events:
+        if not trip_name:
+            continue
+        start = _parse_import_date(trip_start) if not isinstance(trip_start, date) else trip_start
+        end = _parse_import_date(trip_end) if not isinstance(trip_end, date) else trip_end
+        if not start and end:
+            start = end
+        if not end and start:
+            end = start
+        if not start or not end:
+            continue
+
+        name_txt = str(trip_name).strip()
+        label = f"{name_txt} | {start} -> {end}"
+        trip = (name_txt, start, end)
+        label_to_trip[label] = trip
+        norm_label_to_trip[_norm_lookup_text(label)] = trip
+        name_norm_to_trips.setdefault(_norm_lookup_text(name_txt), []).append(trip)
+
+    return label_to_trip, norm_label_to_trip, name_norm_to_trips
+
+
+def _resolve_event_fields(raw_mode, raw_existing_event, raw_new_event_name, raw_start, raw_end, existing_events):
+    notes = []
+    errors = []
+
+    label_to_trip, norm_label_to_trip, name_norm_to_trips = _build_existing_event_maps(existing_events)
+
+    mode_text = _clean_import_text(raw_mode)
+    mode_norm = _norm_lookup_text(mode_text)
+    existing_event_text = _clean_import_text(raw_existing_event)
+    new_event_name_text = _clean_import_text(raw_new_event_name)
+    # Backward compatibility: old template had a single "event" field.
+    if mode_norm in {"createnew", "new", "create"} and not new_event_name_text and existing_event_text:
+        new_event_name_text = existing_event_text
+    if mode_norm in {"useexisting", "existing", "use"} and not existing_event_text and new_event_name_text:
+        existing_event_text = new_event_name_text
+
+    start_provided = not _is_blank_import_value(raw_start)
+    end_provided = not _is_blank_import_value(raw_end)
+    start_date = _parse_import_date(raw_start)
+    end_date = _parse_import_date(raw_end)
+
+    mode = ""
+    if mode_norm in {"useexisting", "existing", "use"}:
+        mode = "Use Existing"
+    elif mode_norm in {"createnew", "new", "create"}:
+        mode = "Create New"
+    elif mode_norm == "":
+        if existing_event_text or new_event_name_text or start_provided or end_provided:
+            mode = "Create New"
+            notes.append("Event mode inferred as Create New")
+        else:
+            return {
+                "Event Mode": "",
+                "Existing Event": "",
+                "New Event Name": "",
+                "Event Start": None,
+                "Event End": None,
+                "travel": 0,
+                "trip_name": None,
+                "trip_start": None,
+                "trip_end": None,
+                "notes": notes,
+                "errors": errors,
+            }
+    else:
+        errors.append("Invalid event mode")
+        mode = mode_text
+
+    if mode == "Use Existing":
+        if not existing_event_text:
+            errors.append("Select an existing event")
+        else:
+            trip = label_to_trip.get(existing_event_text)
+            if not trip:
+                trip = norm_label_to_trip.get(_norm_lookup_text(existing_event_text))
+            if not trip:
+                name_candidates = name_norm_to_trips.get(_norm_lookup_text(existing_event_text), [])
+                if len(name_candidates) == 1:
+                    trip = name_candidates[0]
+                    notes.append("Resolved existing event by name")
+                elif len(name_candidates) > 1:
+                    errors.append("Multiple events share this name; use full event label")
+            if not trip:
+                errors.append("Existing event not found")
+            else:
+                trip_name, trip_start, trip_end = trip
+                return {
+                    "Event Mode": "Use Existing",
+                    "Existing Event": f"{trip_name} | {trip_start} -> {trip_end}",
+                    "New Event Name": "",
+                    "Event Start": trip_start,
+                    "Event End": trip_end,
+                    "travel": 1,
+                    "trip_name": trip_name,
+                    "trip_start": trip_start,
+                    "trip_end": trip_end,
+                    "notes": notes,
+                    "errors": errors,
+                }
+
+    if mode == "Create New":
+        if not new_event_name_text:
+            errors.append("Event name required for Create New")
+        if not start_provided and not end_provided:
+            errors.append("Event date required for Create New")
+        if start_provided and start_date is None:
+            errors.append("Invalid event start date")
+        if end_provided and end_date is None:
+            errors.append("Invalid event end date")
+        if start_date and not end_date:
+            end_date = start_date
+        if end_date and not start_date:
+            start_date = end_date
+        if start_date and end_date and end_date < start_date:
+            errors.append("Event end date is before start date")
+
+        return {
+            "Event Mode": "Create New",
+            "Existing Event": existing_event_text,
+            "New Event Name": new_event_name_text,
+            "Event Start": start_date,
+            "Event End": end_date,
+            "travel": 0 if errors else 1,
+            "trip_name": new_event_name_text if new_event_name_text else None,
+            "trip_start": start_date,
+            "trip_end": end_date,
+            "notes": notes,
+            "errors": errors,
+        }
+
+    return {
+        "Event Mode": mode_text or mode,
+        "Existing Event": existing_event_text,
+        "New Event Name": new_event_name_text,
+        "Event Start": start_date,
+        "Event End": end_date,
+        "travel": 0,
+        "trip_name": None,
+        "trip_start": None,
+        "trip_end": None,
+        "notes": notes,
+        "errors": errors,
+    }
+
+
+def _safe_named_range(name):
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", str(name).strip())
+    if not cleaned:
+        cleaned = "CAT"
+    if cleaned[0].isdigit():
+        cleaned = f"C_{cleaned}"
+    return cleaned[:180]
+
+
+def _build_expense_template_xlsx(cat_to_subs, existing_events=None):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.datavalidation import DataValidation
+        from openpyxl.workbook.defined_name import DefinedName
+    except Exception:
+        return None, "openpyxl is required for smart template export. Install with: `pip install openpyxl`"
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Expenses"
+    list_ws = wb.create_sheet("Lists")
+
+    ws["A1"] = "event_mode"
+    ws["B1"] = "existing_event"
+    ws["C1"] = "new_event_name"
+    ws["D1"] = "event_start"
+    ws["E1"] = "event_end"
+    ws["F1"] = "date"
+    ws["G1"] = "category"
+    ws["H1"] = "subcategory"
+    ws["I1"] = "price"
+    ws["J1"] = "helper"
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+    ws.column_dimensions["A"].width = 16
+    ws.column_dimensions["B"].width = 34
+    ws.column_dimensions["C"].width = 24
+    ws.column_dimensions["D"].width = 16
+    ws.column_dimensions["E"].width = 16
+    ws.column_dimensions["F"].width = 16
+    ws.column_dimensions["G"].width = 24
+    ws.column_dimensions["H"].width = 28
+    ws.column_dimensions["I"].width = 14
+    ws.column_dimensions["J"].hidden = True
+    ws.freeze_panes = "A2"
+
+    list_ws["A1"] = "category"
+    list_ws["B1"] = "range_name"
+
+    categories = sorted(cat_to_subs.keys())
+    used_names = set()
+
+    def add_name(name_obj):
+        try:
+            wb.defined_names.add(name_obj)
+        except Exception:
+            wb.defined_names.append(name_obj)
+
+    if categories:
+        for idx, cat_name in enumerate(categories, start=2):
+            base = _safe_named_range(cat_name)
+            candidate = base
+            suffix = 1
+            while candidate in used_names:
+                suffix += 1
+                candidate = f"{base}_{suffix}"
+            range_name = candidate
+            used_names.add(range_name)
+
+            list_ws.cell(row=idx, column=1, value=cat_name)
+            list_ws.cell(row=idx, column=2, value=range_name)
+
+            col_idx = idx + 1  # C onward
+            col_letter = get_column_letter(col_idx)
+            subs = sorted(cat_to_subs.get(cat_name, []))
+            last_sub_row = 2
+            for sub_row, sub_name in enumerate(subs, start=2):
+                list_ws.cell(row=sub_row, column=col_idx, value=sub_name)
+                last_sub_row = sub_row
+
+            add_name(DefinedName(
+                name=range_name,
+                attr_text=f"Lists!${col_letter}$2:${col_letter}${max(last_sub_row, 2)}"
+            ))
+
+        cat_end = len(categories) + 1
+        add_name(DefinedName(
+            name="Categories",
+            attr_text=f"Lists!$A$2:$A${cat_end}"
+        ))
+
+        for row in range(2, 1001):
+            ws[f"J{row}"] = f'=IFERROR(VLOOKUP(G{row},Lists!$A$2:$B${cat_end},2,FALSE),"")'
+            ws[f"D{row}"].number_format = "yyyy-mm-dd"
+            ws[f"E{row}"].number_format = "yyyy-mm-dd"
+            ws[f"F{row}"].number_format = "yyyy-mm-dd"
+            ws[f"I{row}"].number_format = "0.00"
+
+        dv_category = DataValidation(type="list", formula1="=Categories", allow_blank=False)
+        dv_category.errorTitle = "Invalid Category"
+        dv_category.error = "Choose from the category dropdown."
+        ws.add_data_validation(dv_category)
+        dv_category.add("G2:G1000")
+
+        dv_subcategory = DataValidation(type="list", formula1="=INDIRECT($J2)", allow_blank=False)
+        dv_subcategory.errorTitle = "Invalid Subcategory"
+        dv_subcategory.error = "Choose a valid subcategory for the selected category."
+        ws.add_data_validation(dv_subcategory)
+        dv_subcategory.add("H2:H1000")
+
+    event_rows = existing_events or []
+    ev_label_col_idx = 200
+    ev_name_col_idx = 201
+    ev_start_col_idx = 202
+    ev_end_col_idx = 203
+    ev_label_col = get_column_letter(ev_label_col_idx)
+    ev_name_col = get_column_letter(ev_name_col_idx)
+    ev_start_col = get_column_letter(ev_start_col_idx)
+    ev_end_col = get_column_letter(ev_end_col_idx)
+
+    list_ws[f"{ev_label_col}1"] = "event_label"
+    list_ws[f"{ev_name_col}1"] = "event_name"
+    list_ws[f"{ev_start_col}1"] = "event_start"
+    list_ws[f"{ev_end_col}1"] = "event_end"
+
+    event_end_row = 2
+    if event_rows:
+        for idx, (trip_name, trip_start, trip_end) in enumerate(event_rows, start=2):
+            start = _parse_import_date(trip_start) if not isinstance(trip_start, date) else trip_start
+            end = _parse_import_date(trip_end) if not isinstance(trip_end, date) else trip_end
+            if not start and end:
+                start = end
+            if not end and start:
+                end = start
+            if not trip_name or not start or not end:
+                continue
+            name_txt = str(trip_name).strip()
+            label_txt = f"{name_txt} | {start} -> {end}"
+            list_ws.cell(row=idx, column=ev_label_col_idx, value=label_txt)
+            list_ws.cell(row=idx, column=ev_name_col_idx, value=name_txt)
+            list_ws.cell(row=idx, column=ev_start_col_idx, value=start)
+            list_ws.cell(row=idx, column=ev_end_col_idx, value=end)
+            list_ws.cell(row=idx, column=ev_start_col_idx).number_format = "yyyy-mm-dd"
+            list_ws.cell(row=idx, column=ev_end_col_idx).number_format = "yyyy-mm-dd"
+            event_end_row = idx
+
+        add_name(DefinedName(
+            name="ExistingEvents",
+            attr_text=f"Lists!${ev_label_col}$2:${ev_label_col}${event_end_row}"
+        ))
+
+    for row in range(2, 1001):
+        ws[f"D{row}"] = (
+            f'=IF($A{row}="Use Existing",'
+            f'IFERROR(VLOOKUP($B{row},Lists!${ev_label_col}$2:${ev_end_col}${event_end_row},3,FALSE),""),'
+            f'""'
+            f')'
+        )
+        ws[f"E{row}"] = (
+            f'=IF($A{row}="Use Existing",'
+            f'IFERROR(VLOOKUP($B{row},Lists!${ev_label_col}$2:${ev_end_col}${event_end_row},4,FALSE),""),'
+            f'""'
+            f')'
+        )
+
+    dv_event_mode = DataValidation(type="list", formula1='"Use Existing,Create New"', allow_blank=True)
+    dv_event_mode.errorTitle = "Invalid Event Mode"
+    dv_event_mode.error = "Choose Use Existing or Create New."
+    ws.add_data_validation(dv_event_mode)
+    dv_event_mode.add("A2:A1000")
+
+    if event_rows:
+        # Keep dropdown visible for existing events, but allow manual typing
+        # for Create New mode (validation is enforced again during import).
+        dv_event_list = DataValidation(type="list", formula1="=ExistingEvents", allow_blank=True)
+        dv_event_list.errorStyle = "warning"
+        dv_event_list.errorTitle = "Event not in existing list"
+        dv_event_list.error = "For Create New, you can type a new event name and continue."
+        dv_event_list.showErrorMessage = True
+        ws.add_data_validation(dv_event_list)
+        dv_event_list.add("B2:B1000")
+
+    dv_event_date = DataValidation(
+        type="date",
+        operator="between",
+        formula1="DATE(2000,1,1)",
+        formula2="DATE(2100,12,31)",
+        allow_blank=True
+    )
+    ws.add_data_validation(dv_event_date)
+    dv_event_date.add("D2:D1000")
+    dv_event_date.add("E2:E1000")
+
+    dv_date = DataValidation(
+        type="date",
+        operator="between",
+        formula1="DATE(2000,1,1)",
+        formula2="DATE(2100,12,31)",
+        allow_blank=False
+    )
+    ws.add_data_validation(dv_date)
+    dv_date.add("F2:F1000")
+
+    dv_price = DataValidation(type="decimal", operator="greaterThan", formula1="0", allow_blank=False)
+    ws.add_data_validation(dv_price)
+    dv_price.add("I2:I1000")
+
+    list_ws.sheet_state = "hidden"
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue(), None
+
+
+def _resolve_import_row(
+    raw_date,
+    raw_category,
+    raw_subcategory,
+    raw_amount,
+    raw_event_mode,
+    raw_existing_event,
+    raw_new_event_name,
+    raw_event_start,
+    raw_event_end,
+    cat_to_subs,
+    sub_to_cats,
+    existing_events
+):
+    categories = list(cat_to_subs.keys())
+    all_subs = list(sub_to_cats.keys())
+    notes = []
+
+    parsed_date = _parse_import_date(raw_date)
+    parsed_amount = _parse_import_amount(raw_amount)
+
+    category = _clean_import_text(raw_category)
+    subcategory = _clean_import_text(raw_subcategory)
+
+    if parsed_date is None:
+        notes.append("Invalid date")
+    if parsed_amount is None or parsed_amount <= 0:
+        notes.append("Invalid price")
+
+    cat_norm_map = {_norm_lookup_text(c): c for c in categories}
+    sub_norm_map = {_norm_lookup_text(s): s for s in all_subs}
+
+    resolved_cat = cat_norm_map.get(_norm_lookup_text(category))
+    if not resolved_cat and category:
+        resolved_cat, cat_score = _best_fuzzy_match(category, categories, min_score=0.76)
+        if resolved_cat:
+            notes.append(f"Category fuzzy match ({cat_score:.2f})")
+
+    resolved_sub = None
+    if resolved_cat:
+        sub_candidates = cat_to_subs.get(resolved_cat, [])
+        sub_local_norm = {_norm_lookup_text(s): s for s in sub_candidates}
+        resolved_sub = sub_local_norm.get(_norm_lookup_text(subcategory))
+        if not resolved_sub and subcategory:
+            resolved_sub, sub_score = _best_fuzzy_match(subcategory, sub_candidates, min_score=0.76)
+            if resolved_sub:
+                notes.append(f"Subcategory fuzzy match ({sub_score:.2f})")
+
+    if not resolved_cat or not resolved_sub:
+        global_sub = sub_norm_map.get(_norm_lookup_text(subcategory))
+        if not global_sub and subcategory:
+            global_sub, g_score = _best_fuzzy_match(subcategory, all_subs, min_score=0.82)
+            if global_sub:
+                notes.append(f"Global subcategory fuzzy match ({g_score:.2f})")
+        if global_sub:
+            linked_cats = sub_to_cats.get(global_sub, [])
+            if len(linked_cats) == 1:
+                inferred_cat = linked_cats[0]
+                if not resolved_cat:
+                    resolved_cat = inferred_cat
+                    notes.append("Category inferred from subcategory")
+                if resolved_cat == inferred_cat and not resolved_sub:
+                    resolved_sub = global_sub
+
+    final_cat = resolved_cat or category
+    final_sub = resolved_sub or subcategory
+
+    if not final_cat:
+        notes.append("Missing category")
+    if not final_sub:
+        notes.append("Missing subcategory")
+    if final_cat and final_sub and final_cat in cat_to_subs and final_sub not in cat_to_subs[final_cat]:
+        notes.append("Subcategory does not belong to category")
+
+    event_resolved = _resolve_event_fields(
+        raw_event_mode,
+        raw_existing_event,
+        raw_new_event_name,
+        raw_event_start,
+        raw_event_end,
+        existing_events
+    )
+    notes.extend(event_resolved.get("notes", []))
+    notes.extend(event_resolved.get("errors", []))
+
+    status = "OK" if not notes else "Needs Review"
+    return {
+        "Event Mode": event_resolved.get("Event Mode", ""),
+        "Existing Event": event_resolved.get("Existing Event", ""),
+        "New Event Name": event_resolved.get("New Event Name", ""),
+        "Event Start": event_resolved.get("Event Start"),
+        "Event End": event_resolved.get("Event End"),
+        "Date": parsed_date,
+        "Category": final_cat,
+        "Subcategory": final_sub,
+        "Price": parsed_amount if parsed_amount is not None else raw_amount,
+        "Status": status,
+        "Notes": " | ".join(notes) if notes else "Ready",
+    }
+
+
+def _prepare_expense_import_preview(raw_df, cat_to_subs, sub_to_cats, existing_events):
+    cols = {str(c).strip().lower(): c for c in raw_df.columns}
+
+    def pick_col(names):
+        for n in names:
+            if n in cols:
+                return cols[n]
+        return None
+
+    date_col = pick_col(["date"])
+    cat_col = pick_col(["category"])
+    sub_col = pick_col(["subcategory", "sub_category", "sub category"])
+    amt_col = pick_col(["price", "amount", "amt"])
+    event_mode_col = pick_col(["event_mode", "event mode"])
+    existing_event_col = pick_col(["existing_event", "existing event", "event", "select event", "select_event"])
+    new_event_col = pick_col(["new_event_name", "new event name", "event_name", "event name", "trip_name", "trip name"])
+    event_start_col = pick_col(["event_start", "event start", "trip_start", "trip start"])
+    event_end_col = pick_col(["event_end", "event end", "trip_end", "trip end"])
+
+    missing = []
+    if not date_col:
+        missing.append("date")
+    if not cat_col:
+        missing.append("category")
+    if not sub_col:
+        missing.append("subcategory")
+    if not amt_col:
+        missing.append("price")
+    if missing:
+        return None, f"Missing required columns: {', '.join(missing)}"
+
+    required_cols = [date_col, cat_col, sub_col, amt_col]
+    optional_cols = [c for c in [event_mode_col, existing_event_col, new_event_col, event_start_col, event_end_col] if c]
+    working_df = raw_df[required_cols + optional_cols].copy()
+    working_df = working_df[
+        working_df.apply(
+            lambda r: any(not _is_blank_import_value(r.get(c)) for c in required_cols),
+            axis=1
+        )
+    ]
+
+    if working_df.empty:
+        return None, "No non-empty rows found in CSV."
+
+    parsed_rows = []
+    for _, row in working_df.iterrows():
+        parsed_rows.append(
+            _resolve_import_row(
+                row.get(date_col),
+                row.get(cat_col),
+                row.get(sub_col),
+                row.get(amt_col),
+                row.get(event_mode_col) if event_mode_col else None,
+                row.get(existing_event_col) if existing_event_col else None,
+                row.get(new_event_col) if new_event_col else None,
+                row.get(event_start_col) if event_start_col else None,
+                row.get(event_end_col) if event_end_col else None,
+                cat_to_subs,
+                sub_to_cats,
+                existing_events
+            )
+        )
+
+    preview_df = pd.DataFrame(
+        parsed_rows,
+        columns=[
+            "Event Mode",
+            "Existing Event",
+            "New Event Name",
+            "Event Start",
+            "Event End",
+            "Date",
+            "Category",
+            "Subcategory",
+            "Price",
+            "Status",
+            "Notes",
+        ]
+    )
+    if preview_df.empty:
+        return None, "No rows found in CSV."
+    return preview_df, None
+
+
+def _normalize_event_columns_for_mode(df):
+    if df is None or df.empty:
+        return df, 0
+    if "Event Mode" not in df.columns:
+        return df, 0
+
+    out_df = df.copy()
+    fixed_count = 0
+
+    for idx, row in out_df.iterrows():
+        mode_norm = _norm_lookup_text(row.get("Event Mode"))
+        if mode_norm in {"useexisting", "existing", "use"}:
+            if "New Event Name" in out_df.columns and not _is_blank_import_value(row.get("New Event Name")):
+                out_df.at[idx, "New Event Name"] = ""
+                fixed_count += 1
+        elif mode_norm in {"createnew", "new", "create"}:
+            if "Existing Event" in out_df.columns and not _is_blank_import_value(row.get("Existing Event")):
+                out_df.at[idx, "Existing Event"] = ""
+                fixed_count += 1
+
+    return out_df, fixed_count
+
+
+def _build_event_mode_guard_errors(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    guard_errors = []
+    for idx, row in df.iterrows():
+        row_no = int(idx) + 1
+        mode_norm = _norm_lookup_text(row.get("Event Mode"))
+        existing_event = _clean_import_text(row.get("Existing Event"))
+        new_event_name = _clean_import_text(row.get("New Event Name"))
+
+        if mode_norm in {"useexisting", "existing", "use"} and not existing_event:
+            guard_errors.append({
+                "Row": row_no,
+                "Issue": "Event Mode is Use Existing but Existing Event is empty."
+            })
+        elif mode_norm in {"createnew", "new", "create"} and not new_event_name:
+            guard_errors.append({
+                "Row": row_no,
+                "Issue": "Event Mode is Create New but New Event Name is empty."
+            })
+        elif mode_norm and mode_norm not in {"useexisting", "existing", "use", "createnew", "new", "create"}:
+            guard_errors.append({
+                "Row": row_no,
+                "Issue": "Invalid Event Mode. Use 'Use Existing' or 'Create New'."
+            })
+
+    return pd.DataFrame(guard_errors)
+
+
+def _validate_and_insert_expense_import(db, edited_df):
+    cat_objs = db.query(Category).all()
+    sub_objs = db.query(SubCategory).all()
+    cat_by_id = {c.id: c for c in cat_objs}
+
+    cat_by_norm = {_norm_lookup_text(c.name): c for c in cat_objs}
+    sub_by_pair = {}
+    for s in sub_objs:
+        parent = cat_by_id.get(s.category_id)
+        if parent:
+            sub_by_pair[(parent.id, _norm_lookup_text(s.name))] = s
+
+    existing_events = _get_existing_events(db)
+    existing_event_name_map = {}
+    for ev_name, ev_start, ev_end in existing_events:
+        name_txt = _clean_import_text(ev_name)
+        if not name_txt:
+            continue
+        norm_name = _norm_lookup_text(name_txt)
+        if norm_name and norm_name not in existing_event_name_map:
+            start = _parse_import_date(ev_start) if not isinstance(ev_start, date) else ev_start
+            end = _parse_import_date(ev_end) if not isinstance(ev_end, date) else ev_end
+            if start and not end:
+                end = start
+            if end and not start:
+                start = end
+            if start and end:
+                existing_event_name_map[norm_name] = (name_txt, start, end)
+
+    pending_entries = {}
+    errors = []
+    merged_count = 0
+    batch_new_event_name_map = {}
+
+    for idx, row in edited_df.iterrows():
+        row_no = int(idx) + 1
+        if all(_is_blank_import_value(row.get(col)) for col in ["Date", "Category", "Subcategory", "Price"]):
+            continue
+
+        parsed_date = _parse_import_date(row.get("Date"))
+        parsed_amt = _parse_import_amount(row.get("Price"))
+        cat_raw = _clean_import_text(row.get("Category"))
+        sub_raw = _clean_import_text(row.get("Subcategory"))
+        event_mode_raw = _clean_import_text(row.get("Event Mode"))
+        existing_event_raw = _clean_import_text(row.get("Existing Event"))
+        new_event_name_raw = _clean_import_text(row.get("New Event Name"))
+        event_start_raw = row.get("Event Start")
+        event_end_raw = row.get("Event End")
+
+        row_errors = []
+        if not parsed_date:
+            row_errors.append("Invalid date")
+        if parsed_amt is None or parsed_amt <= 0:
+            row_errors.append("Invalid price")
+
+        cat_obj = cat_by_norm.get(_norm_lookup_text(cat_raw))
+        if not cat_obj:
+            row_errors.append("Category not found")
+            sub_obj = None
+        else:
+            sub_obj = sub_by_pair.get((cat_obj.id, _norm_lookup_text(sub_raw)))
+            if not sub_obj:
+                row_errors.append("Subcategory not found under selected category")
+
+        event_resolved = _resolve_event_fields(
+            event_mode_raw,
+            existing_event_raw,
+            new_event_name_raw,
+            event_start_raw,
+            event_end_raw,
+            existing_events
+        )
+        event_errors = event_resolved.get("errors", [])
+        if event_errors:
+            row_errors.extend(event_errors)
+        else:
+            # If same "Create New" event name appears multiple times, anchor all rows
+            # to one event range (existing first, else first seen in this batch).
+            if event_resolved.get("Event Mode") == "Create New":
+                ev_name_norm = _norm_lookup_text(event_resolved.get("trip_name"))
+                if ev_name_norm:
+                    anchor = (
+                        batch_new_event_name_map.get(ev_name_norm)
+                        or existing_event_name_map.get(ev_name_norm)
+                    )
+                    if anchor:
+                        a_name, a_start, a_end = anchor
+                        event_resolved["travel"] = 1
+                        event_resolved["trip_name"] = a_name
+                        event_resolved["trip_start"] = a_start
+                        event_resolved["trip_end"] = a_end
+                    else:
+                        batch_new_event_name_map[ev_name_norm] = (
+                            event_resolved.get("trip_name"),
+                            event_resolved.get("trip_start"),
+                            event_resolved.get("trip_end")
+                        )
+
+        if row_errors:
+            errors.append({
+                "Row": row_no,
+                "Category": cat_raw,
+                "Subcategory": sub_raw,
+                "Issue": " | ".join(row_errors)
+            })
+            continue
+
+        key = (
+            parsed_date,
+            int(cat_obj.id),
+            int(sub_obj.id),
+            int(event_resolved.get("travel", 0)),
+            _clean_import_text(event_resolved.get("trip_name")) or None,
+            event_resolved.get("trip_start"),
+            event_resolved.get("trip_end"),
+        )
+        if key not in pending_entries:
+            pending_entries[key] = {
+                "date": parsed_date,
+                "category_id": int(cat_obj.id),
+                "subcategory_id": int(sub_obj.id),
+                "travel": int(event_resolved.get("travel", 0)),
+                "trip_name": event_resolved.get("trip_name"),
+                "trip_start": event_resolved.get("trip_start"),
+                "trip_end": event_resolved.get("trip_end"),
+                "amount": 0.0,
+            }
+        pending_entries[key]["amount"] += float(parsed_amt)
+
+    if errors:
+        return 0, merged_count, pd.DataFrame(errors)
+
+    inserted_count = 0
+    for item in pending_entries.values():
+        existing = _find_first_matching_expense(
+            db=db,
+            entry_date=item["date"],
+            category_id=item["category_id"],
+            subcategory_id=item["subcategory_id"],
+            travel=item["travel"],
+            trip_name=item["trip_name"] if item["travel"] == 1 else None,
+            trip_start=item["trip_start"] if item["travel"] == 1 else None,
+            trip_end=item["trip_end"] if item["travel"] == 1 else None
+        )
+        if existing:
+            existing.amount = float(existing.amount) + float(item["amount"])
+            merged_count += 1
+        else:
+            db.add(Expense(
+                category_id=item["category_id"],
+                subcategory_id=item["subcategory_id"],
+                date=item["date"],
+                amount=float(item["amount"]),
+                travel=item["travel"],
+                trip_name=item["trip_name"] if item["travel"] == 1 else None,
+                trip_start=item["trip_start"] if item["travel"] == 1 else None,
+                trip_end=item["trip_end"] if item["travel"] == 1 else None
+            ))
+            inserted_count += 1
+
+    if inserted_count > 0 or merged_count > 0:
+        db.commit()
+    return inserted_count, merged_count, pd.DataFrame()
+
+
+def import_expenses_page():
+    st.title("🧾 Import Expenses")
+
+    with SessionLocal() as db:
+        cat_to_subs, sub_to_cats = _get_expense_catalog(db)
+        existing_events = _get_existing_events(db)
+
+    st.markdown("### Download Smart Template")
+    template_bytes, template_err = _build_expense_template_xlsx(cat_to_subs, existing_events)
+    if template_err:
+        st.warning(template_err)
+    else:
+        st.download_button(
+            "⬇️ Download Smart Import Template (.xlsx)",
+            data=template_bytes,
+            file_name="expense_import_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    st.markdown("### Import Source")
+    source_mode = st.radio(
+        "Source",
+        ["Tracker Imports folder", "Upload from device"],
+        horizontal=True,
+        key="expense_import_source_mode"
+    )
+
+    raw_df = None
+    read_err = None
+
+    if source_mode == "Tracker Imports folder":
+        st.caption(f"Folder: `{LOCAL_IMPORT_DIR}`")
+        col_refresh, _ = st.columns([1, 5])
+        with col_refresh:
+            if st.button("Refresh Folder", key="refresh_local_import_folder"):
+                st.rerun()
+
+        local_files, local_err = _list_local_import_files(LOCAL_IMPORT_DIR)
+        if local_err:
+            st.warning(local_err)
+            return
+        if not local_files:
+            st.info("No `.csv`, `.xlsx`, or `.ods` files found in local Tracker Imports folder.")
+            return
+
+        option_map = {}
+        labels = []
+        for f in local_files:
+            modified_text = datetime.datetime.fromtimestamp(f["mtime"]).strftime("%Y-%m-%d %H:%M")
+            label = f"{f['name']}  ({_fmt_import_file_size(f['size'])}, {modified_text})"
+            option_map[label] = f
+            labels.append(label)
+
+        selected_labels = st.multiselect(
+            "Select file(s) to import",
+            labels,
+            default=[labels[0]],
+            key="local_import_file_pick"
+        )
+        if not selected_labels:
+            return
+
+        frames = []
+        for label in selected_labels:
+            file_meta = option_map[label]
+            this_df, this_err = _read_expense_import_file(file_meta["path"], source_name=file_meta["name"])
+            if this_err:
+                st.error(f"{file_meta['name']}: {this_err}")
+                return
+            if isinstance(this_df, pd.DataFrame) and not this_df.empty:
+                frames.append(this_df)
+
+        if not frames:
+            st.warning("Selected file(s) have no rows to import.")
+            return
+
+        raw_df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+        st.caption(f"Loaded {len(selected_labels)} file(s) from local folder.")
+    else:
+        st.caption("Upload one file directly from your phone or laptop.")
+        uploaded_file = st.file_uploader(
+            "Upload expense file (.csv / .xlsx / .ods)",
+            type=["csv", "xlsx", "ods"],
+            key="expense_csv_upload",
+            label_visibility="collapsed"
+        )
+        if uploaded_file is None:
+            return
+        raw_df, read_err = _read_expense_import_file(uploaded_file, source_name=uploaded_file.name)
+
+    if read_err:
+        st.error(read_err)
+        return
+
+    preview_df, preview_err = _prepare_expense_import_preview(raw_df, cat_to_subs, sub_to_cats, existing_events)
+    if preview_err:
+        st.error(preview_err)
+        return
+
+    st.markdown("### 3) Editable Preview")
+    status_counts = preview_df["Status"].value_counts().to_dict()
+    st.caption(
+        f"Rows: {len(preview_df)} | OK: {status_counts.get('OK', 0)} | Needs Review: {status_counts.get('Needs Review', 0)}"
+    )
+    st.caption("For events: use `Existing Event` only with `Use Existing`, and `New Event Name` only with `Create New`.")
+
+    all_categories = sorted(cat_to_subs.keys())
+    all_subcategories = sorted({s for subs in cat_to_subs.values() for s in subs})
+    edited_df = st.data_editor(
+        preview_df,
+        use_container_width=True,
+        hide_index=True,
+        disabled=["Status", "Notes"],
+        column_config={
+            "Event Mode": st.column_config.SelectboxColumn(
+                "Event Mode",
+                options=["", "Use Existing", "Create New"]
+            ),
+            "Existing Event": st.column_config.TextColumn("Existing Event"),
+            "New Event Name": st.column_config.TextColumn("New Event Name"),
+            "Event Start": st.column_config.DateColumn("Event Start"),
+            "Event End": st.column_config.DateColumn("Event End"),
+            "Date": st.column_config.DateColumn("Date"),
+            "Category": st.column_config.SelectboxColumn("Category", options=all_categories),
+            "Subcategory": st.column_config.SelectboxColumn("Subcategory", options=all_subcategories),
+            "Price": st.column_config.NumberColumn("Price", min_value=0.0, step=1.0),
+            "Status": st.column_config.TextColumn("Status"),
+            "Notes": st.column_config.TextColumn("Notes"),
+        }
+    )
+    normalized_df, fixed_rows = _normalize_event_columns_for_mode(edited_df)
+    if fixed_rows > 0:
+        st.caption("Auto-clean on save: fields are aligned by `Event Mode` (Use Existing vs Create New).")
+
+    if st.button("💾 Save Import to Expenses"):
+        guard_error_df = _build_event_mode_guard_errors(normalized_df)
+        if not guard_error_df.empty:
+            st.error("Event mode validation failed. Fix the rows below and try again.")
+            st.dataframe(guard_error_df, use_container_width=True, hide_index=True)
+            return
+
+        with SessionLocal() as db:
+            inserted, merged, error_df = _validate_and_insert_expense_import(db, normalized_df)
+        if not error_df.empty:
+            st.error("Some rows failed validation. Fix rows and try again.")
+            st.dataframe(error_df, use_container_width=True, hide_index=True)
+            return
+
+        st.session_state.data_refresh += 1
+        if inserted > 0:
+            flash(f"Imported {inserted} expense row(s).")
+        if merged > 0:
+            flash(f"Merged {merged} row group(s) into existing same-day entries.", kind="info")
+        st.rerun()
+
 st.markdown(
     """
     <style>
+    :root {
+        --bg: #000000;
+        --panel: #000000;
+        --border: #000000;
+        --accent: #ffffff;
+        --text: #ffffff;
+        --muted: #ffffff;
+    }
+
+    html, body, .stApp {
+        font-family: "Fira Sans", "Noto Sans", "DejaVu Sans", sans-serif;
+    }
+
+    .block-container {
+        padding-top: 2.2rem;
+        padding-bottom: 1.5rem;
+    }
+
+    h1, h2, h3, h4 {
+        letter-spacing: 0.2px;
+    }
+
     /* ===============================
        BASIC DARK THEME (SAFE)
     =============================== */
 
     .stApp {
-        background-color: #000000;
-        color: #ffffff;
+        background-color: #000000 !important;
+        color: var(--text);
+        background-image: none !important;
+    }
+
+    /* Flat panels (no chrome) */
+    div[data-testid="metric-container"],
+    details,
+    section[data-testid="stSidebar"],
+    div[data-testid="stDataFrame"],
+    div[data-testid="stTable"] {
+        background-color: var(--panel);
+        border: 1px solid var(--border);
     }
 
     header[data-testid="stHeader"] {
-        background: transparent;
+        background: #000000 !important;
+        box-shadow: none !important;
     }
 
     div[data-testid="stToolbar"] {
-        background: #000000;
+        background: #000000 !important;
     }
 
     /* ===============================
@@ -963,23 +2651,84 @@ st.markdown(
     =============================== */
     section[data-testid="stSidebar"] {
         background-color: #000000;
-        border-right: 1px solid #111111;
+        border-right: none;
+    }
+    /* Remove blue focus/selection lines in sidebar */
+    section[data-testid="stSidebar"] *:focus,
+    section[data-testid="stSidebar"] *:focus-visible {
+        outline: none !important;
+        box-shadow: none !important;
+    }
+    section[data-testid="stSidebar"] div[role="radiogroup"] label,
+    section[data-testid="stSidebar"] div[role="radiogroup"] label div,
+    section[data-testid="stSidebar"] div[data-baseweb="radio"] > div,
+    section[data-testid="stSidebar"] div[role="radio"],
+    section[data-testid="stSidebar"] div[role="radio"]::before {
+        border-left: none !important;
+        box-shadow: none !important;
+        background: transparent !important;
     }
 
     /* ===============================
        INPUTS
     =============================== */
     input, textarea, select {
-        background-color: #000000;
         color: #ffffff;
-        border: 1px solid #222222;
+        border: 1px solid #000000;
+        border-radius: 10px;
+        background-color: #000000;
     }
 
     div[data-baseweb="select"] > div,
     div[data-baseweb="input"] > div,
-    div[data-baseweb="datepicker"] > div {
+    div[data-baseweb="datepicker"] > div,
+    div[data-baseweb="textarea"] > div,
+    div[data-baseweb="multiselect"] > div {
+        border: 1px solid #000000;
+        border-radius: 10px;
         background-color: #000000;
-        border: 1px solid #222222;
+    }
+
+    input:focus, textarea:focus, select:focus,
+    div[data-baseweb="select"] > div:focus-within,
+    div[data-baseweb="input"] > div:focus-within,
+    div[data-baseweb="datepicker"] > div:focus-within,
+    div[data-baseweb="textarea"] > div:focus-within,
+    div[data-baseweb="multiselect"] > div:focus-within {
+        box-shadow: 0 0 0 2px rgba(111, 176, 255, 0.2);
+        border-color: rgba(111, 176, 255, 0.5);
+    }
+
+    /* ===============================
+       SURFACE PANELS
+    =============================== */
+    div[data-testid="metric-container"],
+    div[data-testid="stDataFrame"],
+    div[data-testid="stTable"],
+    details,
+    div[data-testid="stForm"],
+    div[data-testid="stContainer"] {
+        border: 1px solid #000000;
+        border-radius: 12px;
+        background-color: #000000;
+        box-shadow: none;
+    }
+
+    /* Expander header (flat) */
+    div[data-testid="stExpander"] details > summary,
+    details > summary {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background-color: #0b0b0b;
+    }
+
+    /* Dropdown menu (flat) */
+    div[data-baseweb="popover"] [role="listbox"],
+    div[data-baseweb="popover"] [data-baseweb="menu"] {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background-color: #0b0b0b;
+        box-shadow: 0 12px 26px rgba(0,0,0,0.6);
     }
 
     /* ===============================
@@ -989,11 +2738,13 @@ st.markdown(
         background-color: #000000;
         color: #ffffff;
         border: 1px solid #333333;
-        transition: transform 0.08s ease;
+        border-radius: 8px;
+        padding: 0.35rem 0.85rem;
+        transition: transform 0.08s ease, border-color 0.15s ease;
     }
 
     button:hover {
-        background-color: #111111;
+        background-color: #0b0b0b;
     }
 
     button:active {
@@ -1005,8 +2756,9 @@ st.markdown(
     =============================== */
     div[data-testid="metric-container"] {
         background-color: #000000;
-        border: 1px solid #222222;
+        border: 1px solid var(--border);
         border-radius: 12px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.25);
         animation: metric-pop 0.35s ease-out;
     }
 
@@ -1047,9 +2799,14 @@ st.markdown(
     /* ===============================
        EXPANDER OPEN HIGHLIGHT
     =============================== */
+    details {
+        background: var(--panel);
+        padding: 0.25rem 0.25rem 0.5rem 0.25rem;
+    }
+
     details[open] {
-        border-left: 3px solid #4da3ff;
-        padding-left: 8px;
+        border-left: 2px solid var(--accent);
+        padding-left: 6px;
         transition: all 0.2s ease;
     }
 
@@ -1271,6 +3028,115 @@ st.markdown(
         transform: none;
     }
 
+    /* ===============================
+       EXTRA UI POLISH
+    =============================== */
+    .stApp {
+        background-image: none !important;
+    }
+
+    /* Subtle hover lift for cards/expanders */
+    details:hover,
+    div[data-testid="metric-container"]:hover,
+    div[data-testid="stDataFrame"]:hover,
+    div[data-testid="stTable"]:hover {
+        transform: translateY(-1px);
+        transition: transform 0.12s ease;
+    }
+
+    /* Sidebar nav polish */
+    section[data-testid="stSidebar"] label {
+        padding: 6px 8px;
+        border-radius: 8px;
+    }
+    section[data-testid="stSidebar"] label:hover {
+        background: rgba(255,255,255,0.04);
+    }
+
+    /* Dataframe zebra striping */
+    div[data-testid="stDataFrame"] table tbody tr:nth-child(odd) {
+        background: #000000;
+    }
+
+    /* Scrollbar styling */
+    *::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+    }
+    *::-webkit-scrollbar-track {
+        background: #0a0a0a;
+    }
+    *::-webkit-scrollbar-thumb {
+        background: #2b2b2b;
+        border-radius: 10px;
+        border: 2px solid #0a0a0a;
+    }
+
+    /* Button glow on hover */
+    button:hover {
+        box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+        border-color: rgba(255,255,255,0.2);
+    }
+
+    /* Higher contrast text */
+    p, li, label, span {
+        color: var(--text);
+    }
+
+    /* Divider styling */
+    hr {
+        border: none;
+        height: 1px;
+        background: #000000;
+    }
+
+    /* Headings (no underline accents) */
+    h1, h2 {
+        position: relative;
+        padding-bottom: 0.25rem;
+        margin-bottom: 0.6rem;
+    }
+    h1::after, h2::after {
+        content: none !important;
+    }
+
+    /* Expander summary styling */
+    details > summary {
+        font-weight: 600;
+        letter-spacing: 0.2px;
+        padding: 0.35rem 0.5rem;
+        border-radius: 8px;
+        background: #000000 !important;
+    }
+    details > summary:hover {
+        background: #000000 !important;
+    }
+
+    /* Alerts (info/success/warn/error) */
+    div[data-testid="stAlert"] {
+        border-radius: 12px;
+        border: 1px solid rgba(255,255,255,0.08);
+        background: rgba(255,255,255,0.03);
+    }
+
+    /* Caption tone */
+    .stCaption, p.stCaption {
+        color: var(--muted);
+    }
+
+    /* Checkbox/Radio spacing for cleaner layout */
+    .stCheckbox, .stRadio {
+        padding: 0.15rem 0.2rem;
+    }
+
+    /* Dataframe header polish */
+    div[data-testid="stDataFrame"] thead tr th {
+        background: rgba(255,255,255,0.03);
+        color: var(--text);
+        font-weight: 600;
+        letter-spacing: 0.2px;
+    }
+
     </style>
     """,
     unsafe_allow_html=True
@@ -1363,6 +3229,18 @@ def section(title, desc):
     st.subheader(title)
     st.caption(desc)
 
+# High-quality PNG export for Plotly charts.
+def plotly_chart_hi_res(fig, use_container_width=True):
+    config = {
+        "displaylogo": False,
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": "chart",
+            "scale": 4,
+        },
+    }
+    st.plotly_chart(fig, use_container_width=use_container_width, config=config)
+
 # Render cumulative spend chart.
 def cumulative_spend_chart(df):
     with st.expander("📈 Cumulative Spending Curve", expanded=False):
@@ -1398,7 +3276,7 @@ def cumulative_spend_chart(df):
             yaxis=dict(gridcolor="#222222")
         )
 
-        st.plotly_chart(fig, use_container_width=True)
+        plotly_chart_hi_res(fig, use_container_width=True)
     
 
 # Render a clean, aligned calendar view with filters and summary.
@@ -1409,8 +3287,6 @@ def render_calendar_view(df):
 
     cal_df = df.copy()
     cal_df["date"] = pd.to_datetime(cal_df["date"])
-
-    st.subheader("📅 Calendar View")
 
     cal_df["month_start"] = cal_df["date"].dt.to_period("M").dt.to_timestamp()
     month_series = (
@@ -1608,7 +3484,7 @@ def render_calendar_view(df):
     # Premium layout: calendar + trend + top categories
     cal_left, cal_right = st.columns([2.2, 1.3])
     with cal_left:
-        st.plotly_chart(fig_cal, use_container_width=True)
+        plotly_chart_hi_res(fig_cal, use_container_width=True)
     with cal_right:
         if daily.empty:
             st.info("No activity in this month.")
@@ -1632,7 +3508,7 @@ def render_calendar_view(df):
                 xaxis=dict(title="", showgrid=False),
                 yaxis=dict(title="", showgrid=True, gridcolor="#1a1a1a")
             )
-            st.plotly_chart(fig_trend, use_container_width=True)
+            plotly_chart_hi_res(fig_trend, use_container_width=True)
 
             top_cats = (
                 month_df.groupby("category")["amount"].sum()
@@ -1655,7 +3531,7 @@ def render_calendar_view(df):
                     xaxis=dict(showgrid=False),
                     yaxis=dict(showgrid=False)
                 )
-                st.plotly_chart(fig_top, use_container_width=True)
+                plotly_chart_hi_res(fig_top, use_container_width=True)
 
     with st.expander("Drilldown Day", expanded=False):
         day_options = sorted(daily["date"].tolist()) if not daily.empty else []
@@ -1693,6 +3569,84 @@ def advanced_analytics(period_df):
     # now call charts
     cumulative_spend_chart(df)
 
+
+# ======================
+# DASHBOARD HELPERS
+# ======================
+@st.cache_data(show_spinner=False)
+def filter_expenses_for_dashboard(
+    df,
+    start_date,
+    end_date,
+    categories,
+    subcategories,
+    min_amount,
+    max_amount
+):
+    if df.empty:
+        return df
+
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"])
+
+    out = out[out["date"].between(pd.Timestamp(start_date), pd.Timestamp(end_date))]
+
+    if categories:
+        out = out[out["category"].isin(categories)]
+
+    if subcategories:
+        out = out[out["subcategory"].isin(subcategories)]
+
+    out = out[out["amount"].between(min_amount, max_amount)]
+
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def build_monthly_snapshots(df):
+    if df.empty:
+        return []
+
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d["month"] = d["date"].dt.to_period("M")
+
+    results = []
+    for m, g in d.groupby("month"):
+        total = float(g["amount"].sum())
+        days = int(g["date"].dt.date.nunique())
+        avg_day = total / days if days else 0.0
+        tx = int(len(g))
+        peak_row = g.groupby(g["date"].dt.date)["amount"].sum().sort_values(ascending=False)
+        peak_day = peak_row.index[0] if not peak_row.empty else None
+        peak_amt = float(peak_row.iloc[0]) if not peak_row.empty else 0.0
+
+        top_cat = (
+            g.groupby("category")["amount"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        top_sub = (
+            g.groupby("subcategory")["amount"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+
+        results.append({
+            "period": m,
+            "label": m.strftime("%b %Y"),
+            "total": total,
+            "avg_day": avg_day,
+            "tx": tx,
+            "peak_day": peak_day,
+            "peak_amt": peak_amt,
+            "top_cat": top_cat.index[0] if not top_cat.empty else "—",
+            "top_sub": top_sub.index[0] if not top_sub.empty else "—",
+        })
+
+    results.sort(key=lambda x: x["period"], reverse=True)
+    return results
+
 # Get price.
 def get_price(db, key, default=0.0):
     row = db.query(AssetPrice).filter(AssetPrice.key == key).first()
@@ -1716,9 +3670,15 @@ def fd_current_value(principal, rate, deposit_date):
 
 
 # Handle fd maturity value.
-def fd_maturity_value(principal, rate, tenure_months):
-    years = tenure_months / 12
+def fd_maturity_value(principal, rate, tenure_days):
+    years = max(float(tenure_days), 0.0) / 365
     return principal * ((1 + rate / 100) ** years)
+
+
+def fd_get_tenure_days(fd):
+    if getattr(fd, "tenure_days", None):
+        return max(int(fd.tenure_days), 1)
+    return max(int((fd.tenure_months or 1) * 30), 1)
 
 APPLIANCE_IMG_DIR = "appliance_images"
 os.makedirs(APPLIANCE_IMG_DIR, exist_ok=True)
@@ -1795,17 +3755,69 @@ def add_expense():
         ).first()
         d = st.date_input("Date", value=date.today())
         amt = st.number_input("Amount (₹)", min_value=0.0)
+        is_travel = st.toggle("Events", value=False)
+        trip_name = None
+        trip_start = None
+        trip_end = None
+        if is_travel:
+            existing_events = load_event_list(st.session_state.data_refresh)
+            event_mode = st.radio(
+                "Event",
+                ["Use Existing", "Create New"],
+                horizontal=True,
+                index=0 if existing_events else 1
+            )
+            if event_mode == "Use Existing":
+                if not existing_events:
+                    st.info("No existing events found. Create a new one below.")
+                    event_mode = "Create New"
+                else:
+                    event_labels = []
+                    event_map = {}
+                    for name, start, end in existing_events:
+                        label = f"{name} | {start} → {end}"
+                        event_labels.append(label)
+                        event_map[label] = (name, start, end)
+                    selected_event = st.selectbox("Select Event", event_labels)
+                    trip_name, trip_start, trip_end = event_map[selected_event]
+            if event_mode == "Create New":
+                trip_name = st.text_input("Event Name", placeholder="")
+                trip_mode = st.radio(
+                    "Event Duration",
+                    ["Single Day", "Multiple Days"],
+                    horizontal=True,
+                    index=0
+                )
+                if trip_mode == "Single Day":
+                    single_day = st.date_input("Event Date", value=date.today())
+                    trip_start, trip_end = single_day, single_day
+                else:
+                    trip_start, trip_end = st.date_input(
+                        "Event Date Range",
+                        value=[date.today(), date.today()]
+                    )
         if st.button("Add Expense"):
             if amt > 0:
-                db.add(Expense(
+                if is_travel and (not trip_name or not trip_start or not trip_end):
+                    st.error("Please enter event name and dates")
+                    return
+                action, _ = _add_or_merge_expense(
+                    db=db,
                     category_id=cat.id,
                     subcategory_id=sub.id,
-                    date=d,
-                    amount=amt
-                ))
+                    entry_date=d,
+                    amount=amt,
+                    travel=1 if is_travel else 0,
+                    trip_name=trip_name if is_travel else None,
+                    trip_start=trip_start if is_travel else None,
+                    trip_end=trip_end if is_travel else None
+                )
                 db.commit()
                 st.session_state.data_refresh += 1
-                flash("Expense added ✅")
+                if action == "merged":
+                    flash("Added to existing same-day entry ✅")
+                else:
+                    flash("Expense added ✅")
                 st.rerun()
             else:
                 st.error("Amount must be greater than 0")
@@ -1895,20 +3907,7 @@ def income_section():
         # INCOME DASHBOARD
         # =================
         st.divider()
-        df = pd.DataFrame(
-            db.query(
-                Income.id,
-                Income.date,
-                Income.amount,
-                IncomeCategory.name.label("category"),
-                IncomeSubCategory.name.label("subcategory")
-            )
-            .join(IncomeCategory, Income.category_id == IncomeCategory.id)
-            .join(IncomeSubCategory, Income.subcategory_id == IncomeSubCategory.id)
-            .order_by(Income.date.desc(), Income.id.desc())
-            .all(),
-            columns=["id", "date", "amount", "category", "subcategory"]
-        )
+        df = load_income_data(st.session_state.data_refresh).copy()
         if df.empty:
             st.info("No income data available")
             return
@@ -1990,7 +3989,7 @@ def income_section():
                 fig_cat = px.pie(cat_pie, names="category", values="amount", hole=0.4)
                 fig_cat.update_layout(paper_bgcolor="#000", font=dict(color="#fff"))
                 fig_cat.update_traces(marker=dict(line=dict(color="black", width=2)))
-                st.plotly_chart(fig_cat, use_container_width=True)
+                plotly_chart_hi_res(fig_cat, use_container_width=True)
 
         with col2:
             st.markdown("**By Subcategory**")
@@ -1999,7 +3998,7 @@ def income_section():
                 fig_sub = px.pie(sub_pie, names="subcategory", values="amount", hole=0.4)
                 fig_sub.update_layout(paper_bgcolor="#000", font=dict(color="#fff"))
                 fig_sub.update_traces(marker=dict(line=dict(color="black", width=2)))
-                st.plotly_chart(fig_sub, use_container_width=True)
+                plotly_chart_hi_res(fig_sub, use_container_width=True)
 
         # =====================
         # MANAGE INCOME ENTRIES
@@ -2035,10 +4034,11 @@ def income_section():
             if action_mode == "Edit Income Entries":
                 all_cats = [c.name for c in db.query(IncomeCategory).all()]
                 all_subs = [s.name for s in db.query(IncomeSubCategory).all()]
+                edit_df = filtered_df.set_index("id")
                 edited_df = st.data_editor(
-                    filtered_df,
+                    edit_df,
                     use_container_width=True,
-                    disabled=["id"],
+                    hide_index=True,
                     column_config={
                         "date": st.column_config.DateColumn("Date"),
                         "amount": st.column_config.NumberColumn("Amount", min_value=0),
@@ -2048,8 +4048,8 @@ def income_section():
                 )
                 if st.button("💾 Save Income Changes"):
                     with db.no_autoflush:
-                        for _, row in edited_df.iterrows():
-                            inc = db.get(Income, int(row["id"]))
+                        for row_id, row in edited_df.iterrows():
+                            inc = db.get(Income, int(row_id))
                             if not inc:
                                 continue
                             inc.date = pd.to_datetime(row["date"]).date()
@@ -2071,6 +4071,7 @@ def income_section():
                             inc.category_id = cat_obj.id
                             inc.subcategory_id = sub_obj.id
                     db.commit()
+                    st.session_state.data_refresh += 1
                     flash("Income entries updated successfully")
                     st.rerun()
             elif action_mode == "Delete Income Entries":
@@ -2108,8 +4109,9 @@ def income_section():
         # ===================================
         # ADVANCED INCOME CATEGORY MANAGEMENT
         # ===================================
-        st.divider()
         with st.expander("⚙️ Advanced (Income Category Management)"):
+            st.caption("Use tabs below to navigate quickly.")
+
             st.subheader("➕ Add Income Category")
             new_cat = st.text_input(
                 "New Income Category",
@@ -2131,159 +4133,169 @@ def income_section():
             if not income_cats:
                 st.info("No income categories available")
                 st.stop()
-            st.subheader("➕ Add Income Subcategory")
-            parent_cat_name = st.selectbox(
-                "Select Parent Category",
-                [c.name for c in income_cats],
-                key="adv_add_income_sub_parent"
-            )
-            parent_cat = db.query(IncomeCategory).filter_by(
-                name=parent_cat_name
-            ).first()
-            new_sub = st.text_input(
-                "New Income Subcategory",
-                placeholder="e.g. Monthly Salary, Bonus",
-                key="adv_add_income_sub"
-            )
-            if st.button("Add Income Subcategory", key="adv_add_income_sub_btn"):
-                if not new_sub.strip():
-                    st.error("Subcategory name cannot be empty")
-                elif db.query(IncomeSubCategory).filter_by(
-                    name=new_sub.strip(),
-                    category_id=parent_cat.id
-                ).first():
-                    st.warning("Subcategory already exists in this category")
-                else:
-                    db.add(
-                        IncomeSubCategory(
-                            name=new_sub.strip(),
-                            category_id=parent_cat.id
-                        )
-                    )
-                    db.commit()
-                    st.session_state.data_refresh += 1
-                    flash("Income subcategory added")
-                    st.rerun()
 
-            # ====================================
-            # RENAME INCOME CATEGORY / SUBCATEGORY
-            # ====================================
-            st.divider()
-            st.subheader("✏️ Rename Income Category")
-            sel_cat_name = st.selectbox(
-                "Select Income Category",
-                [c.name for c in income_cats],
-                key="adv_rename_income_cat_select"
-            )
-            sel_cat = db.query(IncomeCategory).filter_by(name=sel_cat_name).first()
-            new_cat_name = st.text_input(
-                "New Category Name",
-                value=sel_cat.name,
-                key="adv_rename_income_cat"
-            )
-            if st.button("Update Category Name", key="adv_rename_income_cat_btn"):
-                if new_cat_name.strip() and new_cat_name != sel_cat.name:
-                    if db.query(IncomeCategory).filter_by(name=new_cat_name).first():
-                        st.error("Category name already exists")
-                    else:
-                        sel_cat.name = new_cat_name.strip()
-                        db.commit()
-                        st.session_state.data_refresh += 1
-                        flash("Income category renamed")
-                        st.rerun()
-            # =========================
-            # RENAME INCOME SUBCATEGORY
-            # ========================
-            st.subheader("✏️ Rename Income Subcategory")
-            income_subs = db.query(IncomeSubCategory).filter_by(
-                category_id=sel_cat.id
-            ).all()
-            if income_subs:
-                sub_name = st.selectbox(
-                    "Select Subcategory",
-                    [s.name for s in income_subs],
-                    key="adv_rename_income_sub_select"
+            tab_add_sub, tab_rename, tab_delete = st.tabs([
+                "➕ Add Subcategory",
+                "✏️ Rename",
+                "🗑 Delete"
+            ])
+
+            with tab_add_sub:
+                st.subheader("➕ Add Income Subcategory")
+                parent_cat_name = st.selectbox(
+                    "Select Parent Category",
+                    [c.name for c in income_cats],
+                    key="adv_add_income_sub_parent"
                 )
-                sub_obj = db.query(IncomeSubCategory).filter_by(
-                    name=sub_name,
-                    category_id=sel_cat.id
+                parent_cat = db.query(IncomeCategory).filter_by(
+                    name=parent_cat_name
                 ).first()
-                new_sub_name = st.text_input(
-                    "New Subcategory Name",
-                    value=sub_name,
-                    key="adv_rename_income_sub"
+                new_sub = st.text_input(
+                    "New Income Subcategory",
+                    placeholder="e.g. Monthly Salary, Bonus",
+                    key="adv_add_income_sub"
                 )
-                if st.button("Update Subcategory Name", key="adv_rename_income_sub_btn"):
-                    if db.query(IncomeSubCategory).filter_by(
-                        name=new_sub_name,
-                        category_id=sel_cat.id
+                if st.button("Add Income Subcategory", key="adv_add_income_sub_btn"):
+                    if not new_sub.strip():
+                        st.error("Subcategory name cannot be empty")
+                    elif db.query(IncomeSubCategory).filter_by(
+                        name=new_sub.strip(),
+                        category_id=parent_cat.id
                     ).first():
-                        st.error("Subcategory already exists")
+                        st.warning("Subcategory already exists in this category")
                     else:
-                        sub_obj.name = new_sub_name.strip()
+                        db.add(
+                            IncomeSubCategory(
+                                name=new_sub.strip(),
+                                category_id=parent_cat.id
+                            )
+                        )
                         db.commit()
                         st.session_state.data_refresh += 1
-                        flash("Income subcategory renamed")
+                        flash("Income subcategory added")
                         st.rerun()
-            else:
-                st.info("No subcategories available")
-            # ====================================
-            # DELETE INCOME CATEGORY / SUBCATEGORY
-            # ====================================
-            st.divider()
-            st.subheader("🗑 Delete Income Subcategory")
-            st.warning("Deletes ALL income under this subcategory")
-            if income_subs:
-                del_sub_name = st.selectbox(
-                    "Select Subcategory to Delete",
-                    [s.name for s in income_subs],
-                    key="adv_delete_income_sub_select"
+
+            with tab_rename:
+                st.subheader("✏️ Rename Income Category")
+                sel_cat_name = st.selectbox(
+                    "Select Income Category",
+                    [c.name for c in income_cats],
+                    key="adv_rename_income_cat_select"
                 )
-                del_sub = db.query(IncomeSubCategory).filter_by(
-                    name=del_sub_name,
+                sel_cat = db.query(IncomeCategory).filter_by(name=sel_cat_name).first()
+                new_cat_name = st.text_input(
+                    "New Category Name",
+                    value=sel_cat.name,
+                    key="adv_rename_income_cat"
+                )
+                if st.button("Update Category Name", key="adv_rename_income_cat_btn"):
+                    if new_cat_name.strip() and new_cat_name != sel_cat.name:
+                        if db.query(IncomeCategory).filter_by(name=new_cat_name).first():
+                            st.error("Category name already exists")
+                        else:
+                            sel_cat.name = new_cat_name.strip()
+                            db.commit()
+                            st.session_state.data_refresh += 1
+                            flash("Income category renamed")
+                            st.rerun()
+
+                st.divider()
+                st.subheader("✏️ Rename Income Subcategory")
+                income_subs = db.query(IncomeSubCategory).filter_by(
                     category_id=sel_cat.id
-                ).first()
-                if st.checkbox("Confirm delete income subcategory", key="adv_confirm_del_sub"):
-                    if st.button("❌ Delete Income Subcategory", key="adv_delete_income_sub_btn"):
+                ).all()
+                if income_subs:
+                    sub_name = st.selectbox(
+                        "Select Subcategory",
+                        [s.name for s in income_subs],
+                        key="adv_rename_income_sub_select"
+                    )
+                    sub_obj = db.query(IncomeSubCategory).filter_by(
+                        name=sub_name,
+                        category_id=sel_cat.id
+                    ).first()
+                    new_sub_name = st.text_input(
+                        "New Subcategory Name",
+                        value=sub_name,
+                        key="adv_rename_income_sub"
+                    )
+                    if st.button("Update Subcategory Name", key="adv_rename_income_sub_btn"):
+                        if db.query(IncomeSubCategory).filter_by(
+                            name=new_sub_name,
+                            category_id=sel_cat.id
+                        ).first():
+                            st.error("Subcategory already exists")
+                        else:
+                            sub_obj.name = new_sub_name.strip()
+                            db.commit()
+                            st.session_state.data_refresh += 1
+                            flash("Income subcategory renamed")
+                            st.rerun()
+                else:
+                    st.info("No subcategories available")
+
+            with tab_delete:
+                st.subheader("🗑 Delete Income Subcategory")
+                st.warning("Deletes ALL income under this subcategory")
+                del_parent_name = st.selectbox(
+                    "Select Parent Category",
+                    [c.name for c in income_cats],
+                    key="adv_delete_income_sub_parent"
+                )
+                del_parent = db.query(IncomeCategory).filter_by(name=del_parent_name).first()
+                del_income_subs = db.query(IncomeSubCategory).filter_by(
+                    category_id=del_parent.id
+                ).all()
+                if del_income_subs:
+                    del_sub_name = st.selectbox(
+                        "Select Subcategory to Delete",
+                        [s.name for s in del_income_subs],
+                        key="adv_delete_income_sub_select"
+                    )
+                    del_sub = db.query(IncomeSubCategory).filter_by(
+                        name=del_sub_name,
+                        category_id=del_parent.id
+                    ).first()
+                    if st.checkbox("Confirm delete income subcategory", key="adv_confirm_del_sub"):
+                        if st.button("❌ Delete Income Subcategory", key="adv_delete_income_sub_btn"):
+                            db.query(Income).filter(
+                                Income.subcategory_id == del_sub.id
+                            ).delete()
+                            db.delete(del_sub)
+                            db.commit()
+                            st.session_state.data_refresh += 1
+                            flash("Income subcategory deleted")
+                            st.rerun()
+                else:
+                    st.info("No subcategories available for this category")
+
+                st.divider()
+                st.subheader("🗑 Delete Income Category (Danger)")
+                st.warning("Deletes ALL subcategories and ALL income under this category")
+                del_cat_name = st.selectbox(
+                    "Select Income Category to Delete",
+                    [c.name for c in income_cats],
+                    key="adv_delete_income_cat_select"
+                )
+                del_cat = db.query(IncomeCategory).filter_by(name=del_cat_name).first()
+                st.info(f"You are about to delete: **{del_cat.name}**")
+                if st.checkbox("I understand and want to delete this income category", key="adv_confirm_del_cat"):
+                    if st.button("❌ Delete Income Category", key="adv_delete_income_cat_btn"):
                         db.query(Income).filter(
-                            Income.subcategory_id == del_sub.id
+                            Income.category_id == del_cat.id
                         ).delete()
-                        db.delete(del_sub)
+                        db.query(IncomeSubCategory).filter(
+                            IncomeSubCategory.category_id == del_cat.id
+                        ).delete()
+                        db.delete(del_cat)
                         db.commit()
                         st.session_state.data_refresh += 1
-                        flash("Income subcategory deleted")
+                        flash(f"Income category '{del_cat.name}' deleted")
                         st.rerun()
-            # ======================
-            # DELETE INCOME CATEGORY
-            # ======================
-            st.divider()
-            st.subheader("🗑 Delete Income Category (Danger)")
-            st.warning("Deletes ALL subcategories and ALL income under this category")
-            del_cat_name = st.selectbox(
-                "Select Income Category to Delete",
-                [c.name for c in income_cats],
-                key="adv_delete_income_cat_select"
-            )
-            del_cat = db.query(IncomeCategory).filter_by(name=del_cat_name).first()
-            st.info(f"You are about to delete: **{del_cat.name}**")
-            if st.checkbox("I understand and want to delete this income category", key="adv_confirm_del_cat"):
-                if st.button("❌ Delete Income Category", key="adv_delete_income_cat_btn"):
-                    db.query(Income).filter(
-                        Income.category_id == del_cat.id
-                    ).delete()
-                    db.query(IncomeSubCategory).filter(
-                        IncomeSubCategory.category_id == del_cat.id
-                    ).delete()
-                    db.delete(del_cat)
-                    db.commit()
-                    st.session_state.data_refresh += 1
-                    flash(f"Income category '{del_cat.name}' deleted")
-                    st.rerun()
+
         # =====================================================
         # 📄 INCOME PDF EXPORT (ADVANCED – BLACK THEME)
         # =====================================================
-        st.divider()
-
         with st.expander("⬇️ Export Income to PDF", expanded=False):
 
             # -------------------------------
@@ -2387,7 +4399,6 @@ def income_section():
 
                 buffer = BytesIO()
                 doc = SimpleDocTemplate(buffer, pagesize=A4)
-
                 styles = getSampleStyleSheet()
                 styles.add(ParagraphStyle(
                     name="WhiteNormal",
@@ -2421,7 +4432,6 @@ def income_section():
                 ))
                 story.append(Spacer(1, 12))
 
-
                 # ---------- TITLE ----------
                 story.append(Paragraph("Income Report", styles["WhiteTitle"]))
                 story.append(Paragraph(
@@ -2433,9 +4443,7 @@ def income_section():
                 # ---------- TABLE ----------
                 fdf["date"] = fdf["date"].dt.strftime("%Y-%m-%d")
                 fdf["amount"] = fdf["amount"].round(2)
-
                 total_income = fdf["amount"].sum()
-
                 table_data = [list(fdf.columns)] + fdf.values.tolist()
                 table_data.append(["", "", "", "TOTAL", f"{total_income:,.2f}"])
 
@@ -2451,7 +4459,6 @@ def income_section():
                 ]))
 
                 story.append(table)
-
                 story.append(Spacer(1, 20))
                 story.append(Paragraph(
                     f"GRAND TOTAL INCOME: ₹ {total_income:,.2f}",
@@ -2487,9 +4494,6 @@ def income_section():
                     mime="text/csv"
                 )
 
-    
-
-
 # ====================
 # MANAGE CATEGORIES
 # ====================
@@ -2497,9 +4501,6 @@ def income_section():
 def manage_categories():
     st.title("📂 Manage Categories")
     with SessionLocal() as db:
-        # =================
-        # ADD NEW CATEGORY
-        # =================
         st.subheader("➕ Add New Category")
         new_cat = st.text_input(
             "Category Name",
@@ -2516,14 +4517,13 @@ def manage_categories():
                 st.session_state.data_refresh += 1
                 flash("Category added")
                 st.rerun()
-        # =================
-        # MANAGE EXISTING
-        # =================
+
         st.divider()
         cats = db.query(Category).all()
         if not cats:
             st.info("No categories available")
             return
+
         st.subheader("📁 Select Category")
         selected_cat_name = st.selectbox(
             "Choose a category to manage",
@@ -2531,150 +4531,157 @@ def manage_categories():
         )
         cat = db.query(Category).filter_by(name=selected_cat_name).first()
         subs = db.query(SubCategory).filter_by(category_id=cat.id).all()
-        st.divider()
-        st.subheader("✏️ Rename Category")
-        new_cat_name = st.text_input(
-            "New Category Name",
-            value=cat.name
-        )
-        if st.button("Update Category Name"):
-            if not new_cat_name.strip():
-                st.error("Category name cannot be empty")
-            elif new_cat_name != cat.name and db.query(Category).filter_by(name=new_cat_name).first():
-                st.error("Category name already exists")
-            else:
-                cat.name = new_cat_name.strip()
-                db.commit()
-                st.session_state.data_refresh += 1
-                flash("Category renamed")
-                st.rerun()
-        st.divider()
-        # =================     
-        # ADD SUBCATEGORY
-        # =================
-        st.subheader("📄 Subcategories")
-        new_sub = st.text_input(
-            "Add New Subcategory",
-            placeholder="e.g. Bus, Fuel"
-        )
-        if st.button("Add Subcategory"):
-            if not new_sub.strip():
-                st.error("Subcategory name cannot be empty")
-            elif db.query(SubCategory).filter_by(
-                name=new_sub.strip(),
-                category_id=cat.id
-            ).first():
-                st.warning("Subcategory already exists in this category")
-            else:
-                db.add(SubCategory(name=new_sub.strip(), category_id=cat.id))
-                db.commit()
-                st.session_state.data_refresh += 1
-                flash("Subcategory added")
-                st.rerun()
-        if not subs:
-            st.info("No subcategories available")
-            return
-        st.divider()
-        st.subheader("✏️ Rename Subcategory")
-        sub_to_rename = st.selectbox(
-            "Select Subcategory",
-            [s.name for s in subs],
-            key="rename_sub"
-        )
-        sub_obj = db.query(SubCategory).filter_by(
-            name=sub_to_rename,
-            category_id=cat.id
-        ).first()
-        new_sub_name = st.text_input(
-            "New Subcategory Name",
-            value=sub_to_rename
-        )
-        if st.button("Update Subcategory Name"):
-            if not new_sub_name.strip():
-                st.error("Subcategory name cannot be empty")
-            elif db.query(SubCategory).filter_by(
-                name=new_sub_name,  
-                category_id=cat.id
-            ).first():
-                st.error("Subcategory already exists in this category")
-            else:
-                sub_obj.name = new_sub_name.strip()
-                db.commit()
-                st.session_state.data_refresh += 1
-                flash("Subcategory renamed")
-                st.rerun()
-        st.divider()
-        # =================
-        # MOVE SUBCATEGORY
-        # =================
-        st.subheader("🔀 Move Subcategory")
-        sub_to_move = st.selectbox(
-            "Subcategory to Move",
-            [s.name for s in subs],
-            key="move_sub"
-        )
-        target_cat_name = st.selectbox(
-            "Move To Category",
-            [c.name for c in cats if c.id != cat.id],
-            key="target_cat"
-        )
-        target_cat = db.query(Category).filter_by(name=target_cat_name).first()
-        sub_obj = db.query(SubCategory).filter_by(
-            name=sub_to_move,
-            category_id=cat.id
-        ).first()
-        if st.button("Move Subcategory"):
-            exists = db.query(SubCategory).filter_by(
-                name=sub_obj.name,
-                category_id=target_cat.id
-            ).first()
-            if exists:
-                st.error("Subcategory already exists in target category")
-            else:
-                sub_obj.category_id = target_cat.id
-                db.query(Expense).filter(
-                    Expense.subcategory_id == sub_obj.id
-                ).update(
-                    {"category_id": target_cat.id},
-                    synchronize_session=False
-                )
-                db.commit()
-                st.session_state.data_refresh += 1
-                flash(
-                    f"'{sub_obj.name}' moved to '{target_cat.name}' "
-                    "and past expenses updated"
-                )
-                st.rerun()
-        st.divider()
-        # ===========================
-        # DELETE CATEGORY/SUBCATEGORY
-        # ===========================
-        with st.expander("⚠️ Danger Zone (Delete)"):
-            st.warning("These actions are irreversible")
-            st.subheader("🗑 Delete Subcategory")
-            del_sub = st.selectbox(
-                "Subcategory to Delete",
-                [s.name for s in subs],
-                key="del_sub"
+
+        st.caption("Use tabs below to navigate quickly.")
+        tab_category, tab_subcategory, tab_danger = st.tabs([
+            "🏷️ Category",
+            "🗂️ Subcategories",
+            "⚠️ Danger Zone"
+        ])
+
+        with tab_category:
+            st.subheader("✏️ Rename Category")
+            new_cat_name = st.text_input(
+                "New Category Name",
+                value=cat.name
             )
-            if st.checkbox("Confirm delete subcategory"):
-                if st.button("❌ Delete Subcategory"):
-                    sub = db.query(SubCategory).filter_by(
-                        name=del_sub,
-                        category_id=cat.id
-                    ).first()
-                    db.query(Expense).filter_by(
-                        subcategory_id=sub.id
-                    ).delete()
-                    db.delete(sub)
+            if st.button("Update Category Name"):
+                if not new_cat_name.strip():
+                    st.error("Category name cannot be empty")
+                elif new_cat_name != cat.name and db.query(Category).filter_by(name=new_cat_name).first():
+                    st.error("Category name already exists")
+                else:
+                    cat.name = new_cat_name.strip()
                     db.commit()
                     st.session_state.data_refresh += 1
-                    flash("Subcategory deleted")
+                    flash("Category renamed")
                     st.rerun()
+
+        with tab_subcategory:
+            st.subheader("➕ Add Subcategory")
+            new_sub = st.text_input(
+                "Add New Subcategory",
+                placeholder="e.g. Bus, Fuel"
+            )
+            if st.button("Add Subcategory"):
+                if not new_sub.strip():
+                    st.error("Subcategory name cannot be empty")
+                elif db.query(SubCategory).filter_by(
+                    name=new_sub.strip(),
+                    category_id=cat.id
+                ).first():
+                    st.warning("Subcategory already exists in this category")
+                else:
+                    db.add(SubCategory(name=new_sub.strip(), category_id=cat.id))
+                    db.commit()
+                    st.session_state.data_refresh += 1
+                    flash("Subcategory added")
+                    st.rerun()
+
+            if not subs:
+                st.info("No subcategories available")
+            else:
+                st.divider()
+                st.subheader("✏️ Rename Subcategory")
+                sub_to_rename = st.selectbox(
+                    "Select Subcategory",
+                    [s.name for s in subs],
+                    key="rename_sub"
+                )
+                sub_obj = db.query(SubCategory).filter_by(
+                    name=sub_to_rename,
+                    category_id=cat.id
+                ).first()
+                new_sub_name = st.text_input(
+                    "New Subcategory Name",
+                    value=sub_to_rename
+                )
+                if st.button("Update Subcategory Name"):
+                    if not new_sub_name.strip():
+                        st.error("Subcategory name cannot be empty")
+                    elif db.query(SubCategory).filter_by(
+                        name=new_sub_name,
+                        category_id=cat.id
+                    ).first():
+                        st.error("Subcategory already exists in this category")
+                    else:
+                        sub_obj.name = new_sub_name.strip()
+                        db.commit()
+                        st.session_state.data_refresh += 1
+                        flash("Subcategory renamed")
+                        st.rerun()
+
+                st.divider()
+                st.subheader("🔀 Move Subcategory")
+                sub_to_move = st.selectbox(
+                    "Subcategory to Move",
+                    [s.name for s in subs],
+                    key="move_sub"
+                )
+                target_options = [c.name for c in cats if c.id != cat.id]
+                if not target_options:
+                    st.info("Create another category to enable moving subcategories.")
+                else:
+                    target_cat_name = st.selectbox(
+                        "Move To Category",
+                        target_options,
+                        key="target_cat"
+                    )
+                    target_cat = db.query(Category).filter_by(name=target_cat_name).first()
+                    sub_obj = db.query(SubCategory).filter_by(
+                        name=sub_to_move,
+                        category_id=cat.id
+                    ).first()
+                    if st.button("Move Subcategory"):
+                        exists = db.query(SubCategory).filter_by(
+                            name=sub_obj.name,
+                            category_id=target_cat.id
+                        ).first()
+                        if exists:
+                            st.error("Subcategory already exists in target category")
+                        else:
+                            sub_obj.category_id = target_cat.id
+                            db.query(Expense).filter(
+                                Expense.subcategory_id == sub_obj.id
+                            ).update(
+                                {"category_id": target_cat.id},
+                                synchronize_session=False
+                            )
+                            db.commit()
+                            st.session_state.data_refresh += 1
+                            flash(
+                                f"'{sub_obj.name}' moved to '{target_cat.name}' "
+                                "and past expenses updated"
+                            )
+                            st.rerun()
+
+        with tab_danger:
+            st.warning("These actions are irreversible")
+            st.subheader("🗑 Delete Subcategory")
+            if not subs:
+                st.info("No subcategories available")
+            else:
+                del_sub = st.selectbox(
+                    "Subcategory to Delete",
+                    [s.name for s in subs],
+                    key="del_sub"
+                )
+                if st.checkbox("Confirm delete subcategory"):
+                    if st.button("❌ Delete Subcategory"):
+                        sub = db.query(SubCategory).filter_by(
+                            name=del_sub,
+                            category_id=cat.id
+                        ).first()
+                        db.query(Expense).filter_by(
+                            subcategory_id=sub.id
+                        ).delete()
+                        db.delete(sub)
+                        db.commit()
+                        st.session_state.data_refresh += 1
+                        flash("Subcategory deleted")
+                        st.rerun()
+
             st.divider()
-            # ==================
-            # DELETE CATEGORY
-            # ==================
             st.subheader("🗑 Delete Category")
             st.info(f"Selected category: **{cat.name}**")
             if st.checkbox("I understand this will delete ALL related data"):
@@ -2786,10 +4793,11 @@ def manage_entries():
         if action_mode == "Edit Entries":
             all_cats = [c.name for c in db.query(Category).all()]
             all_subs = [s.name for s in db.query(SubCategory).all()]
+            edit_df = df.set_index("id")
             edited_df = st.data_editor(
-                df,
+                edit_df,
                 use_container_width=True,
-                disabled=["id"],
+                hide_index=True,
                 column_config={
                     "date": st.column_config.DateColumn("Date"),
                     "category": st.column_config.SelectboxColumn("Category", options=all_cats),
@@ -2799,8 +4807,8 @@ def manage_entries():
             )
             if st.button("💾 Save Changes"):
                 with db.no_autoflush:
-                    for _, row in edited_df.iterrows():
-                        exp = db.get(Expense, int(row["id"]))
+                    for row_id, row in edited_df.iterrows():
+                        exp = db.get(Expense, int(row_id))
                         if not exp:
                             continue
                         exp.date = pd.to_datetime(row["date"]).date()
@@ -2870,27 +4878,145 @@ def manage_entries():
                         st.session_state.data_refresh += 1
                         flash("All filtered entries deleted")
                         st.rerun()
-                        
+
+# ===============
+# TRAVEL PAGE
+# ===============
+def events_page():
+    st.title("🎫 Events")
+    df = load_events_data(st.session_state.data_refresh).copy()
+    if df.empty:
+        st.info("No events found yet.")
+        return
+
+    df["trip_start"] = pd.to_datetime(df["trip_start"], errors="coerce")
+    df["trip_end"] = pd.to_datetime(df["trip_end"], errors="coerce")
+
+    grouped = df.groupby(["trip_name", "trip_start", "trip_end"], dropna=False)
+    for (tname, tstart, tend), g in grouped:
+        tname_label = str(tname).strip() if pd.notna(tname) and str(tname).strip() else "Untitled Event"
+        start_label = tstart.strftime("%d %b %Y") if pd.notna(tstart) else "—"
+        end_label = tend.strftime("%d %b %Y") if pd.notna(tend) else "—"
+        total = float(g["amount"].sum())
+        label = f"{tname_label} | {start_label} → {end_label} | ₹{total:,.2f}"
+        with st.expander(label, expanded=False):
+            g_view = g[["date", "category", "subcategory", "amount"]].copy()
+            g_view["date"] = pd.to_datetime(g_view["date"]).dt.strftime("%Y-%m-%d")
+            st.dataframe(g_view, use_container_width=True, hide_index=True)
+
+            safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(tname_label)).strip("_") or "event"
+            start_file = tstart.strftime("%Y-%m-%d") if pd.notna(tstart) else "start"
+            end_file = tend.strftime("%Y-%m-%d") if pd.notna(tend) else "end"
+            file_name = f"event_{safe_name}_{start_file}_to_{end_file}.pdf"
+
+            if st.button("🧾 Generate Event PDF", key=f"event_pdf_btn_{safe_name}_{start_file}_{end_file}"):
+                pdf_df = g_view.copy()
+                st.session_state[f"event_pdf_{safe_name}_{start_file}_{end_file}"] = generate_event_pdf_black(
+                    tname_label,
+                    start_label,
+                    end_label,
+                    pdf_df
+                )
+
+            pdf_bytes = st.session_state.get(f"event_pdf_{safe_name}_{start_file}_{end_file}")
+            if pdf_bytes:
+                st.download_button(
+                    "⬇️ Download Event PDF",
+                    data=pdf_bytes,
+                    file_name=file_name,
+                    mime="application/pdf",
+                    key=f"event_pdf_dl_{safe_name}_{start_file}_{end_file}"
+                )
+
+            st.divider()
+            with st.expander("delete", expanded=False):
+                c_del, c_unlink = st.columns(2)
+
+                with c_del:
+                    confirm_delete = st.checkbox(
+                        "Confirm delete event + entries",
+                        key=f"confirm_delete_event_rows_{safe_name}_{start_file}_{end_file}"
+                    )
+                    if st.button("🗑️ Delete Event + Entries", key=f"delete_event_rows_btn_{safe_name}_{start_file}_{end_file}"):
+                        if not confirm_delete:
+                            st.warning("Please confirm deletion first.")
+                        else:
+                            with SessionLocal() as db:
+                                q = db.query(Expense).filter(Expense.travel == 1)
+                                if pd.notna(tname):
+                                    q = q.filter(Expense.trip_name == str(tname))
+                                else:
+                                    q = q.filter(Expense.trip_name.is_(None))
+                                if pd.notna(tstart):
+                                    q = q.filter(Expense.trip_start == tstart.date())
+                                else:
+                                    q = q.filter(Expense.trip_start.is_(None))
+                                if pd.notna(tend):
+                                    q = q.filter(Expense.trip_end == tend.date())
+                                else:
+                                    q = q.filter(Expense.trip_end.is_(None))
+
+                                deleted_count = q.delete(synchronize_session=False)
+                                db.commit()
+
+                            st.session_state.data_refresh += 1
+                            flash(f"Deleted event '{tname_label}' with {deleted_count} entry row(s).")
+                            st.rerun()
+
+                with c_unlink:
+                    confirm_unlink = st.checkbox(
+                        "Confirm remove event tag only",
+                        key=f"confirm_unlink_event_{safe_name}_{start_file}_{end_file}"
+                    )
+                    if st.button("✂️ Remove Event Tag (Keep Entries)", key=f"unlink_event_btn_{safe_name}_{start_file}_{end_file}"):
+                        if not confirm_unlink:
+                            st.warning("Please confirm action first.")
+                        else:
+                            with SessionLocal() as db:
+                                q = db.query(Expense).filter(Expense.travel == 1)
+                                if pd.notna(tname):
+                                    q = q.filter(Expense.trip_name == str(tname))
+                                else:
+                                    q = q.filter(Expense.trip_name.is_(None))
+                                if pd.notna(tstart):
+                                    q = q.filter(Expense.trip_start == tstart.date())
+                                else:
+                                    q = q.filter(Expense.trip_start.is_(None))
+                                if pd.notna(tend):
+                                    q = q.filter(Expense.trip_end == tend.date())
+                                else:
+                                    q = q.filter(Expense.trip_end.is_(None))
+
+                                updated_count = q.update(
+                                    {
+                                        Expense.travel: 0,
+                                        Expense.trip_name: None,
+                                        Expense.trip_start: None,
+                                        Expense.trip_end: None,
+                                    },
+                                    synchronize_session=False
+                                )
+                                db.commit()
+
+                            st.session_state.data_refresh += 1
+                            flash(f"Removed event tag from '{tname_label}' ({updated_count} entry row(s) kept).", kind="info")
+                            st.rerun()
+
 # =================
 # EXPENSE DASHBOARD
 # =================
 # Handle dashboard.
+
+# ============================
+# DASHBOARD RIGHT PANEL
+# ============================
 def dashboard():
     st.title("📊 Dashboard")
 
     # ============================
-    # STATE SAFETY
-    # ============================
-    if "data_refresh" not in st.session_state:
-        st.session_state.data_refresh = 0
-
-    if "show_weekly_trend" not in st.session_state:
-        st.session_state.show_weekly_trend = True
-
-    # ============================
     # LOAD DATA (CACHED – FOR CHARTS)
     # ============================
-    df = load_expense_data(st.session_state.data_refresh)
+    df = load_expense_data(st.session_state.data_refresh).copy()
 
     if df.empty:
         st.info("No data available")
@@ -2899,9 +5025,57 @@ def dashboard():
     df["date"] = pd.to_datetime(df["date"])
 
     # ============================
-    # CALENDAR VIEW
+    # MONTHLY SNAPSHOTS
     # ============================
-    render_calendar_view(df)
+    with st.expander("📌 Monthly Snapshot Cards", expanded=False):
+        st.caption("Auto-updated monthly highlight cards.")
+
+        if df.empty:
+            st.info("No data available.")
+        else:
+            st.markdown(
+                """
+                <style>
+                .snapshot-card {
+                    background: #0b0b0b;
+                    border: 1px solid #1f1f1f;
+                    border-radius: 12px;
+                    padding: 14px 16px;
+                    margin-bottom: 14px;
+                }
+                .snapshot-title {
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: #ffffff;
+                    margin-bottom: 6px;
+                }
+                .snapshot-row {
+                    font-size: 13px;
+                    color: #cfcfcf;
+                    margin: 2px 0;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+
+            snapshots = build_monthly_snapshots(df)
+            for snap in snapshots:
+                peak_label = snap["peak_day"].strftime("%d %b %Y") if snap["peak_day"] else "—"
+                st.markdown(
+                    f"""
+                    <div class="snapshot-card">
+                        <div class="snapshot-title">{snap["label"]}</div>
+                        <div class="snapshot-row">Total: ₹ {snap["total"]:,.2f}</div>
+                        <div class="snapshot-row">Average per day: ₹ {snap["avg_day"]:,.2f}</div>
+                        <div class="snapshot-row">Transactions: {snap["tx"]}</div>
+                        <div class="snapshot-row">Peak day: {peak_label} (₹ {snap["peak_amt"]:,.2f})</div>
+                        <div class="snapshot-row">Top category: {snap["top_cat"]}</div>
+                        <div class="snapshot-row">Top subcategory: {snap["top_sub"]}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
     # ============================
     # COMMON DATE ANCHORS
@@ -2954,7 +5128,8 @@ def dashboard():
         selected_date = st.sidebar.date_input(
             "",
             value=today_date,
-            label_visibility="collapsed"
+            label_visibility="collapsed",
+            key="daily_buy_date"
         )
 
         daily_df = pd.DataFrame(
@@ -3031,9 +5206,14 @@ def dashboard():
         c2.metric("Year So Far", f"₹ {year_expense:,.2f}")
 
     # ============================
+    # CALENDAR VIEW
+    # ============================
+    with st.expander("📅 Calendar View", expanded=False):
+        render_calendar_view(df)
+
+    # ============================
     # PERIOD FILTER (CHARTS)
     # ============================
-    st.divider()
     with st.expander("📅 Period Filter & Pie Charts", expanded=False):
     
         period_mode = st.radio(
@@ -3145,7 +5325,7 @@ def dashboard():
             )
             fig_cat.update_traces(marker=dict(line=dict(color="black", width=2)))
 
-            st.plotly_chart(fig_cat, use_container_width=True)
+            plotly_chart_hi_res(fig_cat, use_container_width=True)
 
         # =====================
         # SUBCATEGORY CHART
@@ -3204,7 +5384,7 @@ def dashboard():
                     )
                     fig_sub.update_traces(marker=dict(line=dict(color="black", width=2)))
 
-                    st.plotly_chart(fig_sub, use_container_width=True)
+                    plotly_chart_hi_res(fig_sub, use_container_width=True)
 
                 else:
                     fig_bar = px.bar(
@@ -3225,7 +5405,7 @@ def dashboard():
                     )
                     fig_bar.update_traces(marker=dict(line=dict(color="black", width=2)))
                     fig_bar.update_traces(marker=dict(line=dict(color="black", width=2)))
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                    plotly_chart_hi_res(fig_bar, use_container_width=True)
                 
         # ============================
         # BAR → TRANSACTION TABLE
@@ -3354,7 +5534,7 @@ def dashboard():
                             font=dict(color="#fff"),
                             margin=dict(l=10, r=10, t=40, b=10)
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        plotly_chart_hi_res(fig, use_container_width=True)
 
                 elif variant == "Sunburst (Category → Subcategory)":
                     agg = agg_metric(adv_df, ["category", "subcategory"])
@@ -3385,7 +5565,7 @@ def dashboard():
                             font=dict(color="#fff"),
                             margin=dict(l=10, r=10, t=40, b=10)
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        plotly_chart_hi_res(fig, use_container_width=True)
 
                 elif variant == "Waterfall (Month-over-Month Change)":
                     monthly = agg_metric(
@@ -3415,7 +5595,7 @@ def dashboard():
                             yaxis_title="Change",
                             margin=dict(l=20, r=20, t=40, b=40)
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        plotly_chart_hi_res(fig, use_container_width=True)
 
                 else:  # Distribution (Box Plot by Category)
                     if adv_df.empty:
@@ -3436,7 +5616,7 @@ def dashboard():
                             margin=dict(l=20, r=20, t=40, b=40)
                         )
                         fig.update_traces(marker=dict(color="#4da3ff"))
-                        st.plotly_chart(fig, use_container_width=True)
+                        plotly_chart_hi_res(fig, use_container_width=True)
 
     advanced_analytics(period_df)
     # ============================
@@ -3550,6 +5730,7 @@ def dashboard():
                 f"₹ {total_value:,.2f}"
             )
 
+
 ## ======================================
 # INSIGHTS
 # ======================================
@@ -3559,7 +5740,7 @@ def insights():
     # ============================
     # AVERAGE SPEND & HIGHEST MONTH
     # ============================
-    df = load_expense_data(st.session_state.data_refresh)
+    df = load_expense_data(st.session_state.data_refresh).copy()
     if df.empty:
         st.info("No data available")
         st.stop()
@@ -3822,7 +6003,7 @@ def insights():
             margin=dict(l=20, r=20, t=40, b=40),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
         )
-        st.plotly_chart(fig, use_container_width=True)
+        plotly_chart_hi_res(fig, use_container_width=True)
 
     # ============================
 # EXPENSE PDF EXPORT SECTION
@@ -3947,6 +6128,103 @@ def export_pdf(df, footer_text=""):
     buffer.seek(0)
     return buffer   
 
+# Export a single event to a black-themed PDF.
+def generate_event_pdf_black(event_name, start_label, end_label, df):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=28,
+        leftMargin=28,
+        topMargin=28,
+        bottomMargin=28
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        name="EventTitleBlack",
+        parent=styles["Title"],
+        fontName="DejaVu",
+        fontSize=18,
+        textColor=colors.white,
+        spaceAfter=10
+    )
+    meta_style = ParagraphStyle(
+        name="EventMetaBlack",
+        parent=styles["Normal"],
+        fontName="DejaVu",
+        fontSize=10,
+        textColor=colors.white,
+        leading=14
+    )
+
+    total = float(df["amount"].sum()) if not df.empty else 0.0
+
+    story = []
+    story.append(Paragraph(f"Event Report — {event_name}", title_style))
+    story.append(Paragraph(f"Date range: {start_label} → {end_label}", meta_style))
+    story.append(Paragraph(f"Total spend: ₹ {total:,.2f}", meta_style))
+    story.append(Spacer(1, 12))
+
+    table_rows = [["Date", "Category", "Subcategory", "Amount (₹)"]]
+    for _, row in df.iterrows():
+        table_rows.append([
+            row["date"],
+            row["category"],
+            row["subcategory"],
+            f"{float(row['amount']):,.2f}"
+        ])
+
+    col_widths = [
+        doc.width * 0.22,
+        doc.width * 0.28,
+        doc.width * 0.32,
+        doc.width * 0.18
+    ]
+    table = Table(table_rows, colWidths=col_widths, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "DejaVu"),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.black),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.black),
+        ("TEXTCOLOR", (0, 1), (-1, -1), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ALIGN", (0, 0), (-2, -1), "LEFT"),
+        ("ALIGN", (-1, 1), (-1, -1), "RIGHT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 10))
+
+    total_table = Table(
+        [["TOTAL", f"₹ {total:,.2f}"]],
+        colWidths=[doc.width - col_widths[-1], col_widths[-1]],
+        hAlign="LEFT"
+    )
+    total_table.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "DejaVu"),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.white),
+        ("LINEABOVE", (0, 0), (-1, 0), 0.6, colors.white),
+        ("ALIGN", (0, 0), (0, 0), "LEFT"),
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(total_table)
+
+    def black_bg(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(colors.black)
+        canvas.rect(0, 0, doc.pagesize[0], doc.pagesize[1], fill=1)
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=black_bg, onLaterPages=black_bg)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 # Export data.
 def export_data():
     st.title("📤 Export")
@@ -4048,7 +6326,7 @@ def export_data():
                 df = df.sort_values("Date", ascending=False)
                 top_row = df.groupby("Subcategory")["Amount"].sum().idxmax()
                 top_amt = df.groupby("Subcategory")["Amount"].sum().max()
-                st.dataframe(df, use_container_width=True)
+                st.dataframe(df, use_container_width=True, hide_index=True)
                 footer_text = (
                     f"Exported on: {today.strftime('%Y-%m-%d')} | "
                     f"Period: {period} | "
@@ -4077,7 +6355,8 @@ def export_data():
                 pd.DataFrame(
                     columns=["Date", "Category", "Subcategory", "Amount"]
                 ),
-                use_container_width=True
+                use_container_width=True,
+                hide_index=True
             )
         # =========================
         # SUMMARY / TOTALS EXPORT
@@ -4164,7 +6443,7 @@ def export_data():
                 st.info("No data for selected filters")
 
             else:
-                st.dataframe(df_sum, use_container_width=True)
+                st.dataframe(df_sum, use_container_width=True, hide_index=True)
 
                 # --- CATEGORY TOTAL VIEW
                 cat_total_df = (
@@ -4192,7 +6471,7 @@ def export_data():
 
 
                 st.subheader("📌 Category Totals")
-                st.dataframe(cat_total_df, use_container_width=True)
+                st.dataframe(cat_total_df, use_container_width=True, hide_index=True)
 
                 # --- CSV EXPORT (CATEGORY TOTALS ONLY)
                 st.download_button(
@@ -4337,7 +6616,7 @@ def assets_page():
             fig1 = px.pie(df_main, names="Category", values="Value", hole=0.4)
             fig1.update_layout(paper_bgcolor="#000", font=dict(color="white"))
             fig1.update_traces(marker=dict(line=dict(color="black", width=2)))
-            st.plotly_chart(fig1, use_container_width=True)
+            plotly_chart_hi_res(fig1, use_container_width=True)
 
         with col2:
             # ---------- LIC SUB-BREAKDOWN ----------
@@ -4369,7 +6648,7 @@ def assets_page():
             fig2 = px.pie(df_sub, names="Asset", values="Value", hole=0.4)
             fig2.update_layout(paper_bgcolor="#000", font=dict(color="white"))
             fig2.update_traces(marker=dict(line=dict(color="black", width=2)))
-            st.plotly_chart(fig2, use_container_width=True)
+            plotly_chart_hi_res(fig2, use_container_width=True)
 
         # =====================================================
         # VALUATION SUMMARY (NUMBERS BELOW PIE CHARTS)
@@ -4452,10 +6731,11 @@ def assets_page():
                 df = df.sort_values(["Date", "id"], ascending=[False, False]).reset_index(drop=True)
 
             if not df.empty:
-                edited = st.data_editor(df, disabled=["id"])
+                edit_df = df.set_index("id")
+                edited = st.data_editor(edit_df, hide_index=True)
                 if st.button("💾 Save Metal Changes"):
-                    for _, r in edited.iterrows():
-                        a = db.get(MetalAsset, int(r["id"]))
+                    for row_id, r in edited.iterrows():
+                        a = db.get(MetalAsset, int(row_id))
                         if a:
                             a.metal_type = r["Metal"]
                             a.weight_grams = r["Weight (g)"]
@@ -4509,10 +6789,11 @@ def assets_page():
                 land_tbl = land_tbl.sort_values("id", ascending=False).reset_index(drop=True)
 
             if not land_tbl.empty:
-                edited = st.data_editor(land_tbl, disabled=["id"])
+                edit_tbl = land_tbl.set_index("id")
+                edited = st.data_editor(edit_tbl, hide_index=True)
                 if st.button("💾 Save Land Changes"):
-                    for _, r in edited.iterrows():
-                        l = db.get(LandAsset, int(r["id"]))
+                    for row_id, r in edited.iterrows():
+                        l = db.get(LandAsset, int(row_id))
                         if l:
                             l.location = r["Place"]
                             l.area_size = r["Sqft"]
@@ -4544,31 +6825,13 @@ def assets_page():
             fd_name = st.text_input("FD Name")
             principal = st.number_input("Principal (₹)", min_value=0.0, step=1000.0)
             rate = st.number_input("Interest Rate (%)", min_value=0.0, step=0.1)
-            tenure_type = st.radio(
-                "Tenure Type",
-                ["Years", "Months", "Days"],
-                horizontal=True
-            )
-
-            tenure_value = st.number_input(
-                f"Tenure ({tenure_type})",
-                min_value=1,
-                step=1
-            )
-
-            # Convert everything to days
-            if tenure_type == "Years":
-                tenure_days = tenure_value * 365
-            elif tenure_type == "Months":
-                tenure_days = tenure_value * 30
-            else:
-                tenure_days = tenure_value
+            tenure_days = st.number_input("Tenure (Days)", min_value=1, step=1)
 
             deposit_date = st.date_input("Deposit Date")
 
             maturity_date = deposit_date + timedelta(days=tenure_days)
-            tenure_months = max(1, round(tenure_days / 30))
-            maturity_amt = fd_maturity_value(principal, rate, tenure_months)
+            tenure_months_legacy = max(1, round(tenure_days / 30))
+            maturity_amt = fd_maturity_value(principal, rate, tenure_days)
 
             c1, c2 = st.columns(2)
             c1.metric("Maturity Amount (₹)", f"{maturity_amt:,.2f}")
@@ -4580,7 +6843,8 @@ def assets_page():
                         name=fd_name,
                         principal=principal,
                         rate=rate,
-                        tenure_months=tenure_months,
+                        tenure_months=tenure_months_legacy,
+                        tenure_days=tenure_days,
                         deposit_date=deposit_date,
                         maturity_date=maturity_date,
                         status="active"
@@ -4607,7 +6871,7 @@ def assets_page():
                     "Name": fd.name,
                     "Principal": fd.principal,
                     "Rate (%)": fd.rate,
-                    "Tenure (Months)": fd.tenure_months,
+                    "Tenure (Days)": fd_get_tenure_days(fd),
                     "Deposit Date": fd.deposit_date,
                     "Maturity Date": fd.maturity_date,
                     "Current Value (₹)": fd_current_value(
@@ -4620,34 +6884,35 @@ def assets_page():
                     ascending=[False, False]
                 ).reset_index(drop=True)
 
+                edit_active = active_df.set_index("id")
                 edited_df = st.data_editor(
-                    active_df,
-                    disabled=["id", "Current Value (₹)", "Maturity Date"],
+                    edit_active,
+                    disabled=["Current Value (₹)", "Maturity Date"],
                     use_container_width=True,
+                    hide_index=True,
                     column_config={
                         "Name": st.column_config.TextColumn("FD Name"),
                         "Principal": st.column_config.NumberColumn("Principal (₹)", min_value=0),
                         "Rate (%)": st.column_config.NumberColumn("Rate (%)", min_value=0),
                         "Deposit Date": st.column_config.DateColumn("Deposit Date"),
-                        "Tenure (Months)": st.column_config.NumberColumn(
-                            "Tenure (Months)", min_value=1
+                        "Tenure (Days)": st.column_config.NumberColumn(
+                            "Tenure (Days)", min_value=1
                         )
                     }
                 )
 
 
                 if st.button("💾 Save Active FD Changes"):
-                    for _, row in edited_df.iterrows():
-                        fd = db.get(FixedDeposit, int(row["id"]))
+                    for row_id, row in edited_df.iterrows():
+                        fd = db.get(FixedDeposit, int(row_id))
                         if fd:
                             fd.name = row["Name"]
                             fd.principal = float(row["Principal"])
                             fd.rate = float(row["Rate (%)"])
                             fd.deposit_date = pd.to_datetime(row["Deposit Date"]).date()
-                            fd.tenure_months = int(row["Tenure (Months)"])
-                            fd.maturity_date = fd.deposit_date + relativedelta(
-                                months=fd.tenure_months
-                            )
+                            fd.tenure_days = int(row["Tenure (Days)"])
+                            fd.tenure_months = max(1, round(fd.tenure_days / 30))
+                            fd.maturity_date = fd.deposit_date + timedelta(days=fd.tenure_days)
                     db.commit()
                     flash("Active FDs updated successfully")
                     st.rerun()
@@ -4687,11 +6952,11 @@ def assets_page():
                     "Name": fd.name,
                     "Principal": fd.principal,
                     "Rate (%)": fd.rate,
-                    "Tenure (Months)": fd.tenure_months,
+                    "Tenure (Days)": fd_get_tenure_days(fd),
                     "Deposit Date": fd.deposit_date,
                     "Maturity Date": fd.maturity_date,
                     "Maturity Amount (₹)": fd_maturity_value(
-                        fd.principal, fd.rate, fd.tenure_months
+                        fd.principal, fd.rate, fd_get_tenure_days(fd)
                     )
                 } for fd in matured_fds])
                 matured_df["Maturity Date"] = pd.to_datetime(matured_df["Maturity Date"])
@@ -4700,7 +6965,8 @@ def assets_page():
                     ascending=[False, False]
                 ).reset_index(drop=True)
 
-                st.dataframe(matured_df, use_container_width=True)
+                matured_view = matured_df.drop(columns=["id"], errors="ignore")
+                st.dataframe(matured_view, use_container_width=True, hide_index=True)
 
                 col1, col2 = st.columns(2)
 
@@ -4733,15 +6999,15 @@ def assets_page():
                         old = db.get(FixedDeposit, int(renew_id))
                         if old:
                             new_dep = date.today()
-                            new_mat = new_dep + relativedelta(
-                                months=old.tenure_months
-                            )
+                            old_tenure_days = fd_get_tenure_days(old)
+                            new_mat = new_dep + timedelta(days=old_tenure_days)
 
                             db.add(FixedDeposit(
                                 name=f"{old.name} (Renewed)",
                                 principal=old.principal,
                                 rate=old.rate,
-                                tenure_months=old.tenure_months,
+                                tenure_months=max(1, round(old_tenure_days / 30)),
+                                tenure_days=old_tenure_days,
                                 deposit_date=new_dep,
                                 maturity_date=new_mat,
                                 status="active"
@@ -4823,15 +7089,16 @@ def assets_page():
 
             if not lic_df.empty:
                 lic_df = lic_df.sort_values("id", ascending=False).reset_index(drop=True)
+                edit_lic = lic_df.set_index("id")
                 edited = st.data_editor(
-                    lic_df,
-                    disabled=["id"],
-                    use_container_width=True
+                    edit_lic,
+                    use_container_width=True,
+                    hide_index=True
                 )
 
                 if st.button("💾 Save LIC Changes"):
-                    for _, r in edited.iterrows():
-                        p = db.get(LICPolicy, int(r["id"]))
+                    for row_id, r in edited.iterrows():
+                        p = db.get(LICPolicy, int(row_id))
                         if p:
                             p.policy_name = r["Policy Name"]
                             p.premium_amount = float(r["Premium Amount"])
@@ -5063,7 +7330,12 @@ def assets_page():
                 if "Fixed Deposits" in export_sections:
                     try:
                         fd_df = pd.read_sql("""
-                            SELECT name, principal, rate, tenure_months, deposit_date
+                            SELECT
+                                name,
+                                principal,
+                                rate,
+                                COALESCE(tenure_days, tenure_months * 30) AS tenure_days,
+                                deposit_date
                             FROM fixed_deposits
                         """, engine)
 
@@ -5090,7 +7362,7 @@ def assets_page():
                             "TOTAL",   # Deposit Account
                             "",        # principal
                             "",        # rate
-                            "",        # months
+                            "",        # tenure_days
                             "",        # deposit_date
                             f"{total_fd:,.2f}"  # Current Value
                         ])
@@ -5107,7 +7379,6 @@ def assets_page():
                             ("LEFTPADDING", (0,0), (-1,-1), 6),
                             ("RIGHTPADDING", (0,0), (-1,-1), 6),
                         ]))
-
 
                         story.append(table)
 
@@ -5169,7 +7440,6 @@ def assets_page():
                 ))
 
                 from reportlab.lib import colors
-
                 # Handle black page background.
                 def black_page_background(canvas, doc):
                     canvas.saveState()
@@ -5184,13 +7454,11 @@ def assets_page():
                     )
                     canvas.restoreState()
 
-
                 doc.build(
                     story,
                     onFirstPage=black_page_background,
                     onLaterPages=black_page_background
                 )
-
 
                 st.download_button(
                     "⬇️ Download Assets PDF",
@@ -5198,7 +7466,6 @@ def assets_page():
                     file_name="assets_report.pdf",
                     mime="application/pdf"
                 )
-
 
 # ======================
 # APPLIANCES PAGE   
@@ -5248,7 +7515,6 @@ def appliances_page():
 
         if submit and name:
             db = SessionLocal()
-
             appliance = Appliance(
                 name=name,
                 price=price,
@@ -5294,7 +7560,6 @@ def appliances_page():
     # APPLIANCES PIE CHARTS
     # ======================
     with st.expander("📊 Appliance Insights", expanded=False):
-
         chart_type = st.radio(
             "View",
             ["By Value", "By Purchase Year"],
@@ -5302,7 +7567,6 @@ def appliances_page():
         )
 
         if appliances:
-
             # ---------- BY VALUE ----------
             if chart_type == "By Value":
                 df_pie = pd.DataFrame([{
@@ -5345,23 +7609,19 @@ def appliances_page():
                 marker=dict(line=dict(color="black", width=2))
             )
 
-            st.plotly_chart(fig, use_container_width=True)
+            plotly_chart_hi_res(fig, use_container_width=True)
 
         else:
             st.info("No appliance data available to visualize.")
 
-
     for a in appliances:
-
         with st.expander(f"{a.name} | ₹{a.price:,.0f} | {a.purchase_date}"):
 
             # ======================
             # VIEW MODE
             # ======================
             if not is_edit_mode(a.id):
-
                 c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-
                 c1.write(f"**Appliance**: {a.name}")
                 c2.write(f"**Price**: ₹{a.price:,.2f}")
                 c3.write(f"**Purchased**: {a.purchase_date}")
@@ -5403,7 +7663,6 @@ def appliances_page():
                                 if img_db:
                                     if os.path.exists(img_db.image_path):
                                         os.remove(img_db.image_path)
-
                                     db.delete(img_db)
                                     db.commit()
                                     db.close()
@@ -5430,7 +7689,6 @@ def appliances_page():
             # ======================
             else:
                 with st.form("edit_form_" + str(a.id)):
-
                     col1, col2 = st.columns(2)
                     with col1:
                         edit_name = st.text_input(
@@ -5465,14 +7723,12 @@ def appliances_page():
                     )
 
                     col_save, col_cancel = st.columns(2)
-
                     save = col_save.form_submit_button("💾 Save Changes")
                     cancel = col_cancel.form_submit_button("❌ Cancel")
 
                     if save:
                         db = SessionLocal()
                         appliance = db.get(Appliance, a.id)
-
                         appliance.name = edit_name
                         appliance.price = edit_price
                         appliance.purchase_date = edit_purchase_date
@@ -5527,12 +7783,10 @@ def appliances_page():
                 if no.button("Cancel", key="no_" + str(a.id)):
                     del st.session_state["confirm_" + str(a.id)]
 
-            
 # ======================
 # APPLIANCES PDF EXPORT
 # ======================
     st.divider()
-
     with st.expander("⬇️ Export Appliances Data as PDF", expanded=False):
 
                 if st.button(
@@ -5670,10 +7924,173 @@ def appliances_page():
                         mime="application/pdf"
                     )
 
+# ======================
+# CAPABILITIES PAGE
+# ======================
+def capabilities_page():
+    st.title("🧭 Tracker Capabilites")
+    st.caption("A clean map of what your tracker covers, grouped by purpose.")
+
+    st.markdown("## ✅ Everyday Tracking")
+    st.markdown(
+        """
+**Expenses**
+- Add expenses with category and subcategory
+- Edit and delete entries, including bulk actions
+- Monthly, yearly, and custom period filters
+- Daily buy sidebar drilldown
+
+**Income**
+- Add income with category and subcategory
+- Period filters and income summaries
+- Edit and delete income entries
+- Breakdown charts by category and subcategory
+        """
+    )
+
+    st.markdown("## 📊 Analytics & Insights")
+    st.markdown(
+        """
+**Visual Analytics**
+- Calendar view with daily totals and filters
+- Cumulative spending curve
+- Category and subcategory charts (pie or bar)
+- Advanced visuals: treemap, sunburst, waterfall, distribution
+
+**Insights**
+- Average spend (weekly, monthly, yearly)
+- Top 5 categories and subcategories per month
+- Category trend comparison (month‑over‑month)
+- Anomaly detection using rolling median and MAD
+        """
+    )
+
+    st.markdown("## 🏦 Assets & Net Worth")
+    st.markdown(
+        """
+**Assets**
+- Metals (gold and silver) with weight-based valuation
+- Land assets with location-based pricing
+- Fixed deposits with maturity tracking and renewal
+- LIC policies with maturity value tracking
+- Asset dashboard totals and breakdowns
+        """
+    )
+
+    st.markdown("## 🔌 Appliances")
+    st.markdown(
+        """
+**Inventory**
+- Appliance inventory with warranty tracking
+- Image uploads (appliance and invoice)
+- Appliance insights charts
+- Appliance PDF report export
+        """
+    )
+
+    st.markdown("## 📤 Exports & Reports")
+    st.markdown(
+        """
+**Exports**
+- Expense CSV and PDF exports by period and filters
+- Category totals CSV and PDF summary
+- Income PDF export
+- Assets PDF export
+
+**Reports**
+- Weekly and monthly expense reports (PDF)
+- Manual monthly report sender from sidebar
+        """
+    )
+
+    st.markdown("## ⚙️ Automation & Storage")
+    st.markdown(
+        """
+**Automation**
+- Weekly Google Drive database backup (when available)
+- Weekly and monthly email reports via SMTP
+
+**Storage**
+- Local SQLite database by default
+- Fully offline unless email or Google Drive features are enabled
+        """
+    )
+
+
+def longevity_check_page():
+    st.title("🛡️ Longevity Check")
+    st.caption("Local-first 10-year maintenance checklist for your tracker.")
+
+    now_dt = datetime.datetime.now()
+    backup_raw = read_state_value(BACKUP_STATE_FILE)
+    maint_raw = read_state_value(DB_MAINT_STATE_FILE)
+    weekly_raw = read_state_value(WEEKLY_EMAIL_STATE_FILE)
+    monthly_raw = read_state_value(MONTHLY_EMAIL_STATE_FILE)
+
+    backup_dt = _parse_state_datetime(backup_raw)
+    maint_dt = _parse_state_datetime(maint_raw)
+
+    backup_days = (now_dt - backup_dt).days if backup_dt else None
+    maint_days = (now_dt - maint_dt).days if maint_dt else None
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Last Backup", format_state_value(backup_raw))
+        st.caption("Target: once every 7 days")
+    with c2:
+        st.metric("Last DB Maintenance", format_state_value(maint_raw))
+        st.caption("Target: once every 30 days")
+    with c3:
+        db_size, db_size_err = get_db_size()
+        st.metric("DB Size", format_bytes(db_size) if db_size is not None else "N/A")
+        if db_size is None:
+            st.caption(db_size_err)
+
+    st.markdown("### Checklist")
+    st.write(f"{'✅' if backup_days is not None and backup_days <= 7 else '⚠️'} Weekly backup freshness (<= 7 days)")
+    st.write(f"{'✅' if maint_days is not None and maint_days <= 30 else '⚠️'} DB maintenance freshness (<= 30 days)")
+    st.write(f"{'✅' if os.path.exists('requirements.txt') else '⚠️'} `requirements.txt` present")
+    st.write(f"{'⚠️' if os.path.exists(SECRETS_FILE_PATH) else '✅'} Secrets file location review")
+    st.write(f"{'✅' if weekly_raw else '⚠️'} Weekly email status file present")
+    st.write(f"{'✅' if monthly_raw else '⚠️'} Monthly email status file present")
+
+    st.markdown("### Maintenance Actions")
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        if st.button("Run Integrity Check"):
+            ok, msg = run_db_integrity_check()
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+    with a2:
+        if st.button("Run DB Maintenance Now"):
+            with st.spinner("Running DB maintenance..."):
+                ok, msg = run_db_maintenance()
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+    with a3:
+        if st.button("Verify Backup File"):
+            ok, msg = verify_gdrive_backup()
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+    st.markdown("### Safety Snapshot")
+    st.caption("Download a portable local snapshot (CSV tables + requirements) for long-term recoverability.")
+    snapshot_bytes = _build_safety_snapshot_zip()
+    st.download_button(
+        "⬇️ Download Safety Snapshot (.zip)",
+        data=snapshot_bytes,
+        file_name=f"tracker_safety_snapshot_{date.today().isoformat()}.zip",
+        mime="application/zip"
+    )
 
 
 st.markdown('<div id="breadcrumbs"></div>', unsafe_allow_html=True)
-
 # ======================
 # SIDEBAR NAVIGATION
 # ======================
@@ -5683,13 +8100,17 @@ page = st.sidebar.radio(
     [
     "📊 Expense Dashboard",
     "➕ Add Expense",
+    "🧾 Import Expenses",
+    "🎫 Events",
     "📤 Export Expenses",
     "🔌 Appliances Data",
     "💰 Income",
     "🏦 Assets",
     "📈 Insights",
+    "🛡️ Longevity Check",
+    "🧭 Tracker Capabilites",
     ],
-    index =0
+    index=1
 )       
 with st.sidebar.expander("📨 Send Monthly Report"):
     month_options = get_month_options(24)
@@ -5704,18 +8125,31 @@ with st.sidebar.expander("📨 Send Monthly Report"):
             with st.spinner("Sending monthly report..."):
                 send_custom_monthly_report(month_map[selected_label], target_email)
 
+if st.sidebar.button("Backup Database Now"):
+    with st.sidebar.spinner("Backing up database..."):
+        ok, msg = backup_db_to_gdrive()
+    if ok:
+        st.sidebar.success("Database backed up.")
+    else:
+        st.sidebar.error(msg)
+
+render_system_status_panel()
+
 # ======================
 # PAGE ROUTING
 # ======================
-
 PAGE_ORDER = {
     "📊 Expense Dashboard": 0,
     "➕ Add Expense": 1,
-    "📤 Export Expenses": 2,
-    "🔌 Appliances Data": 3,
-    "💰 Income": 4,
-    "🏦 Assets": 5,
-    "📈 Insights": 6
+    "🧾 Import Expenses": 2,
+    "🎫 Events": 3,
+    "📤 Export Expenses": 4,
+    "🔌 Appliances Data": 5,
+    "💰 Income": 6,
+    "🏦 Assets": 7,
+    "📈 Insights": 8,
+    "🛡️ Longevity Check": 9,
+    "🧭 Tracker Capabilites": 10
 }
 
 current_page = page                                                # whatever variable you use
@@ -5738,7 +8172,6 @@ st.markdown(                                                       # inject dire
 # ======================
 # BREADCRUMBS RENDERING
 # ======================
-# Render breadcrumbs.
 def render_breadcrumbs(page):                             
     st.markdown(
         f"""
@@ -5756,13 +8189,21 @@ if page == "📊 Expense Dashboard":
     dashboard()
 elif page == "➕ Add Expense":
     add_expense()
+elif page == "🧾 Import Expenses":
+    import_expenses_page()
+elif page == "🎫 Events":
+    events_page()
 elif page == "💰 Income":
     income_section()
 elif page == "🏦 Assets":
     assets_page()
 elif page == "📈 Insights":
     insights()
+elif page == "🛡️ Longevity Check":
+    longevity_check_page()
 elif page == "🔌 Appliances Data":
     appliances_page()
 elif page == "📤 Export Expenses":
     export_data()
+elif page == "🧭 Tracker Capabilites":
+    capabilities_page()

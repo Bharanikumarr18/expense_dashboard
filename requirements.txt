@@ -8,4 +8,8 @@ python-dateutil
 streamlit-aggrid
 setuptools
 matplotlib
-
+pytesseract
+Pillow
+opencv-python
+openpyxl
+odfpy
